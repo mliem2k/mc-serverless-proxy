@@ -1,0 +1,14 @@
+[Unit]
+Description=Custom UDP relay (home side), bridges catcher's public Bedrock port to local Geyser
+After=network.target frpc.service
+Requires=frpc.service
+
+[Service]
+Type=simple
+Environment=RELAY_AUTH_TOKEN=REPLACE_ME
+ExecStart=/usr/local/bin/udp_relay_home.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

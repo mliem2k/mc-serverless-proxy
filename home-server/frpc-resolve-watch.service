@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch mc-backend.YOURDOMAIN.com's IP and keep frpc pointed at it
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc_resolve_loop.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

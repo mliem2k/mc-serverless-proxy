@@ -1,0 +1,18 @@
+[Unit]
+Description=Custom UDP relay (catcher side), fixes frp's NAT-breaking UDP proxy for Bedrock
+After=network.target frps.service
+Requires=frps.service
+
+[Service]
+Type=simple
+Environment=RELAY_AUTH_TOKEN=REPLACE_ME
+Environment=BIND_HOST=YOUR_CATCHER_STATIC_IP
+Environment=GCP_PROJECT=YOUR_GCP_PROJECT_ID
+Environment=GCP_RELAY_ZONE=YOUR_RELAY_ZONE
+Environment=GCP_RELAY_INSTANCE=YOUR_RELAY_VM_NAME
+ExecStart=/usr/local/bin/udp_relay_catcher.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

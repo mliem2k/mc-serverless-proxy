@@ -1,0 +1,14 @@
+[Unit]
+Description=Check relay VM idle state, shut down within 5 min of last player disconnect
+
+[Service]
+Type=oneshot
+# Runs as root (needs /sbin/poweroff), but cf_dns_update.ts's readToken() resolves
+# ~/.cfcli.yml via os.homedir(), which follows $HOME first. Without this, root's
+# homedir (/root) has no .cfcli.yml (it lives at /home/mliem/.cfcli.yml, the same
+# file relay-ddns.service's User=mliem already reads fine), so every DNS-reset
+# subprocess call this spawns failed with ENOENT, confirmed live 2026-07-19: idle
+# shutdown never got past the DNS-reset step, silently leaving the DNS pointed at
+# the dead relay IP after every poweroff until fixed by hand.
+Environment=HOME=/home/mliem
+ExecStart=/usr/local/bin/bun /usr/local/bin/idle_shutdown.ts

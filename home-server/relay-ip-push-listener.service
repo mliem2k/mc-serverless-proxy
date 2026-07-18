@@ -1,0 +1,14 @@
+[Unit]
+Description=Listen for catcher's push of the relay's current IP, bypassing DNS propagation delay
+After=network.target frpc.service
+Requires=frpc.service
+
+[Service]
+Type=simple
+Environment=RELAY_IP_PUSH_TOKEN=REPLACE_ME
+ExecStart=/usr/local/bin/relay_ip_push_listener.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

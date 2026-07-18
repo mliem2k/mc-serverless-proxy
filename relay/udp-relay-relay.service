@@ -1,0 +1,14 @@
+[Unit]
+Description=Custom UDP relay (relay side), gives Bedrock players the same low-latency relay path as Java
+After=network.target frps.service
+Requires=frps.service
+
+[Service]
+Type=simple
+Environment=RELAY_AUTH_TOKEN=REPLACE_ME
+ExecStart=/usr/local/bin/udp_relay_relay.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

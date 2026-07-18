@@ -1,0 +1,37 @@
+# The DYNAMIC tunnel: serverAddr follows wherever mc-backend currently resolves
+# (catcher normally, the relay once it's woken and warm), see
+# home-server/frpc_resolve_loop.ts. Proxies here only need to be reachable while
+# THIS specific target is active, unlike home-server/frpc-catcher.toml's proxies,
+# which need catcher specifically, always, regardless of where this file points.
+serverAddr = "YOUR_RELAY_CURRENT_IP"
+serverPort = 7000
+auth.method = "token"
+auth.token = "REPLACE_ME"
+
+[[proxies]]
+name = "minecraft"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 25565
+remotePort = 25565
+
+[proxies.transport]
+proxyProtocolVersion = "v2"
+
+# Carries relay/udp_relay_relay.ts's control channel when this tunnel is pointed at
+# the relay (2026-07-19 addition, gives Bedrock players the same low-latency relay
+# path Java players already get; the relay had zero Bedrock support before this,
+# confirmed live: mc.mliem.com flipping to the relay's IP on every wake silently
+# broke Bedrock connectivity for real players until this existed). Belongs on THIS
+# dynamic tunnel, not the permanent one: it only ever needs to be reachable while
+# serverAddr above actually points at the relay, which is exactly when this file's
+# tunnel connects there. Uses a distinct port (19135) from catcher's own
+# udp-relay-control (19133, in frpc-catcher.toml) so both can coexist without a frps
+# proxy-name/port collision on the rare occasion this file briefly registers
+# against catcher instead.
+[[proxies]]
+name = "udp-relay-control-relay"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19135
+remotePort = 19135

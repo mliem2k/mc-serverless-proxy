@@ -1,0 +1,12 @@
+[Unit]
+Description=frp client (always-on catcher tunnel)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/frpc -c /etc/frp/frpc-catcher.toml
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

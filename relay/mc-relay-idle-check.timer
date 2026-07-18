@@ -1,0 +1,10 @@
+[Unit]
+Description=Run mc-relay-idle-check every 20s (cron can't go sub-minute)
+
+[Timer]
+OnBootSec=20s
+OnUnitActiveSec=20s
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

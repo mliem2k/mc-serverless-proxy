@@ -1,0 +1,50 @@
+# The PERMANENT tunnel: always dials catcher's own static IP directly, never
+# follows the relay the way home-server/frpc.toml (the dynamic one) does. Proxies
+# here need to be reachable from catcher regardless of whether the dynamic tunnel
+# currently points at catcher or the relay, this is what makes that possible.
+serverAddr = "YOUR_CATCHER_STATIC_IP"
+serverPort = 7000
+auth.method = "token"
+auth.token = "REPLACE_ME"
+
+# The always-on path: catcher's own frps forwards straight to this, independent of
+# the dynamic tunnel's target, so players can always reach the server via catcher
+# even while the dynamic tunnel is pointed at the relay for someone else's session.
+[[proxies]]
+name = "minecraft-catcher"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 25565
+remotePort = 25565
+transport.proxyProtocolVersion = "v2"
+
+# Carries catcher/udp_relay_catcher.ts's control channel (catcher/udp_relay_catcher.ts
+# <-> home-server/udp_relay_home.ts), NOT a UDP proxy. frp's own `type = "udp"` proxy
+# relays replies from a dynamically allocated port instead of the port the request
+# arrived on, which breaks NAT traversal for real clients (confirmed live
+# 2026-07-18). frp's TCP proxying is unaffected by that bug, so this plain TCP proxy
+# just carries a private, token-authenticated tunnel for the custom relay's own
+# framed protocol. Lives on THIS permanent tunnel, not the dynamic one: catcher is
+# always the entry point for players who haven't been transferred yet, so its UDP
+# relay control channel needs to always be reachable too, regardless of where the
+# dynamic tunnel currently points (confirmed live 2026-07-18: putting this on the
+# dynamic tunnel instead broke catcher's Bedrock relay every time it moved to the
+# relay for an unrelated Java wake).
+[[proxies]]
+name = "udp-relay-control"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19133
+remotePort = 19133
+
+# Carries catcher_wake_watcher.ts's push of the relay's current IP straight to
+# relay_ip_push_listener.ts here, bypassing DNS propagation delay (measured live
+# 2026-07-18 at 31.5s-63.4s, the single biggest chunk of end-to-end transfer
+# latency). Same reasoning as udp-relay-control above: this needs to always be
+# reachable from catcher, not just while the dynamic tunnel happens to point there.
+[[proxies]]
+name = "relay-ip-push"
+type = "tcp"
+localIP = "127.0.0.1"
+localPort = 19134
+remotePort = 19134

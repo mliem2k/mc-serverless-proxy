@@ -1,0 +1,19 @@
+[Unit]
+Description=Watch MC server log for joins and transfer to the relay once it's ready
+After=network.target
+
+[Service]
+Type=simple
+# transfer_one.ts (spawned as a child of this process) needs PANEL_EMAIL to log
+# into the PufferPanel API; it inherits this from the parent's environment.
+# Confirmed live 2026-07-19: without this, every transfer attempt failed with
+# "set PUFFERPANEL_EMAIL in the environment" right after this watcher correctly
+# detected the relay was ready, silently stranding the player on catcher instead
+# of handing them off to the low-latency relay.
+Environment=PUFFERPANEL_EMAIL=YOUR_PUFFERPANEL_ADMIN_EMAIL
+ExecStart=/usr/local/bin/join_transfer_watcher.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

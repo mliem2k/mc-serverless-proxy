@@ -1,0 +1,12 @@
+[Unit]
+Description=Watch for new connections on the always-on catcher tunnel and wake the relay VM
+After=network.target frps.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/catcher_wake_watcher.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

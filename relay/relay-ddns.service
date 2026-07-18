@@ -1,0 +1,12 @@
+[Unit]
+Description=Update Cloudflare DNS to this VM's current IP on boot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=YOUR_LINUX_USER
+ExecStart=/usr/local/bin/relay_boot_ddns.ts
+
+[Install]
+WantedBy=multi-user.target
