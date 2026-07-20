@@ -1,0 +1,14 @@
+[Unit]
+Description=Push real-time player join/leave events to the mc-status webhook
+After=network.target
+
+[Service]
+Type=simple
+Environment=MC_STATUS_WEBHOOK_URL=https://www.mliem.com/api/mc-status/events
+Environment=MC_STATUS_WEBHOOK_TOKEN=YOUR_MC_STATUS_WEBHOOK_TOKEN
+ExecStart=/usr/local/bin/mc_status_events_watcher.ts
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
