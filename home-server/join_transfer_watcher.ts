@@ -2,11 +2,12 @@
 // Tails the actual Minecraft server log for real "joined the game" events (unambiguous,
 // unlike raw TCP connection counting, this can't false-positive on a status/server-list
 // ping). For each new join, checks whether the relay is reachable right now; if not,
-// polls for up to ~2 minutes (it may still be booting, the catcher-side wake watcher is
-// what actually triggers that boot, independently, on the raw connection). As soon as
-// it's reachable, transfers that specific player via XferHelper so their gameplay
-// bypasses the catcher. If a player joins after the relay is already warm, this
-// transfers them immediately with no polling needed.
+// starts the waiting lobby (XferHelper's /xferlobby start) and polls for up to ~2
+// minutes (it may still be booting, the catcher-side wake watcher is what actually
+// triggers that boot, independently, on the raw connection). As soon as it's reachable,
+// transfers that specific player via XferHelper so their gameplay bypasses the catcher.
+// If a player joins after the relay is already warm, this transfers them immediately
+// with no polling or lobby needed.
 //
 // "Reachable" is checked with a real Minecraft handshake + status request
 // (mc_slp_check.ts), not a bare TCP connect. A bare TCP connect can succeed before the
@@ -43,6 +44,14 @@ const BACKEND_HOST = "mc-backend.YOURDOMAIN.com";
 // "transfer" was a same-catcher loopback, and the player saw "you're now on the fast
 // route" while still actually being served through catcher (confirmed live 2026-07-18).
 const CATCHER_IP = "YOUR_CATCHER_STATIC_IP";
+
+// PufferPanel console access for /xferlobby start|cancel, the same login-then-POST
+// pattern transfer_one.ts uses for /xfer. Kept in-process here (rather than shelling
+// out to a separate script per call) since these calls don't need the dedup/cooldown
+// bookkeeping transfer_one.ts's caller already provides.
+const CREDS_PATH = "/root/pufferpanel-admin-pass.txt";
+const PANEL_EMAIL = process.env.PUFFERPANEL_EMAIL;
+const PANEL_SERVER_ID = "YOUR_PUFFERPANEL_SERVER_ID";
 
 const lastTransferred = new Map<string, number>();
 
@@ -84,6 +93,66 @@ function recentlyTransferred(player: string): boolean {
   return last !== undefined && Date.now() - last < COOLDOWN_MS;
 }
 
+// Same login-then-POST-console pattern transfer_one.ts uses, for XferHelper's
+// /xferlobby start|cancel. A fresh login per call (no cookie caching) matches how
+// transfer_one.ts already re-logs-in on every separate invocation, so this doesn't
+// regress anything, just moves the same flow in-process.
+async function sendConsoleCommand(command: string): Promise<void> {
+  if (!PANEL_EMAIL) throw new Error("set PUFFERPANEL_EMAIL in the environment");
+  const password = (await Bun.file(CREDS_PATH).text()).trim();
+  const loginRes = await fetch("http://localhost:8080/auth/login", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email: PANEL_EMAIL, password }),
+  });
+  if (loginRes.status !== 200) throw new Error(`login failed: ${loginRes.status}`);
+  const cookie = loginRes.headers.get("set-cookie")?.split(";")[0];
+  if (!cookie) throw new Error("login succeeded but no session cookie was returned");
+  await fetch(`http://localhost:8080/api/servers/${PANEL_SERVER_ID}/console`, {
+    method: "POST",
+    headers: { Cookie: cookie },
+    body: command,
+  });
+}
+
+// A relay IP equal to CATCHER_IP means mc-backend hasn't actually moved off catcher yet
+// (relay not woken/ready), not a real "reachable relay" reading. Without this exclusion
+// a fast-joining player could get "transferred" to mc-backend while it still points at
+// catcher, a same-catcher loopback that tells them they're on the fast route while they
+// aren't (real bug, fixed 2026-07-18, preserved here as its own helper so restructuring
+// handleJoin can't accidentally drop it again).
+async function checkRelayReady(): Promise<string | null> {
+  const ip = await resolveBackend();
+  if (!ip) return null;
+  if (ip === CATCHER_IP) {
+    logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
+    return null;
+  }
+  return isReachable(ip) ? ip : null;
+}
+
+// The readiness check resolves and dials the IP directly (it needs a real socket to
+// test), but the transfer target passed to XferHelper is the hostname, not that
+// resolved IP. TransferTool's transfer-mappings (see the README's "Bedrock/mobile
+// cross-play" section) key on the Java Transfer packet's destination host:port, and
+// that mapping is static config, it can't track the relay's IP changing on every boot.
+// Transferring by hostname keeps the mapping valid regardless of which IP mc-backend
+// currently resolves to.
+async function doTransfer(player: string, ip: string): Promise<void> {
+  logger(`join_transfer_watcher: relay answered a real status request at ${ip}, transferring ${player} via ${BACKEND_HOST}`);
+  lastTransferred.set(player, Date.now());
+  try {
+    const out = execFileSync(
+      "bun",
+      ["run", `${import.meta.dir}/transfer_one.ts`, player, BACKEND_HOST, String(PORT)],
+      { encoding: "utf8" },
+    );
+    logger(`transfer_one: ${out.trim()}`);
+  } catch (err) {
+    logger(`transfer_one: failed: ${err}`);
+  }
+}
+
 async function handleJoin(player: string) {
   if (recentlyTransferred(player)) {
     logger(`join_transfer_watcher: ${player} rejoined within cooldown of its own transfer, skipping (not a new session)`);
@@ -91,43 +160,34 @@ async function handleJoin(player: string) {
   }
   logger(`join_transfer_watcher: ${player} joined, checking relay readiness`);
 
-  // 24 attempts x 5s tightened to 120 x 1s on 2026-07-18 (same ~2min total budget,
-  // just finer-grained). Unlike frpc_resolve_loop.ts's DNS poll (which restarts frpc
-  // on every "IP differs from current" reading, so a flapping DNS answer compounds
-  // into repeated restarts), this loop only ever takes its one consequential action
-  // (the transfer) after isReachable() succeeds with a real handshake, and returns
-  // immediately once it does. A flaky intermediate DNS answer here just means one more
-  // failed isReachable() and another 1s wait, not a bad transfer, so there's no
-  // equivalent flapping risk to tightening it.
-  for (let i = 0; i < 120; i++) {
-    const ip = await resolveBackend();
-    if (ip && ip === CATCHER_IP) {
-      logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
-    } else if (ip && isReachable(ip)) {
-      // The readiness check above resolves and dials the IP directly (it needs a
-      // real socket to test), but the transfer target passed to XferHelper is the
-      // hostname, not that resolved IP. TransferTool's transfer-mappings (see the
-      // README's "Bedrock/mobile cross-play" section) key on the Java Transfer
-      // packet's destination host:port, and that mapping is static config, it can't
-      // track the relay's IP changing on every boot. Transferring by hostname keeps
-      // the mapping valid regardless of which IP mc-backend currently resolves to.
-      logger(`join_transfer_watcher: relay answered a real status request at ${ip}, transferring ${player} via ${BACKEND_HOST}`);
-      lastTransferred.set(player, Date.now());
-      try {
-        const out = execFileSync(
-          "bun",
-          ["run", `${import.meta.dir}/transfer_one.ts`, player, BACKEND_HOST, String(PORT)],
-          { encoding: "utf8" },
-        );
-        logger(`transfer_one: ${out.trim()}`);
-      } catch (err) {
-        logger(`transfer_one: failed: ${err}`);
-      }
+  const firstIp = await checkRelayReady();
+  if (firstIp) {
+    await doTransfer(player, firstIp);
+    return;
+  }
+
+  try {
+    await sendConsoleCommand(`xferlobby ${player} start`);
+  } catch (err) {
+    logger(`join_transfer_watcher: failed to start lobby for ${player}: ${err}`);
+  }
+
+  // 23 attempts x 5s ~= 2min total budget, matching the log messages below.
+  for (let i = 0; i < 23; i++) {
+    await Bun.sleep(5000);
+    const ip = await checkRelayReady();
+    if (ip) {
+      await doTransfer(player, ip);
       return;
     }
-    await Bun.sleep(5000);
   }
-  logger(`join_transfer_watcher: relay never became reachable within 2min for ${player}, leaving on catcher path`);
+
+  logger(`join_transfer_watcher: relay never became reachable within 2min for ${player}, releasing from lobby`);
+  try {
+    await sendConsoleCommand(`xferlobby ${player} cancel`);
+  } catch (err) {
+    logger(`join_transfer_watcher: failed to cancel lobby for ${player}: ${err}`);
+  }
 }
 
 const JOIN_PATTERN = /]: ([A-Za-z0-9_]{3,16}) joined the game/;
