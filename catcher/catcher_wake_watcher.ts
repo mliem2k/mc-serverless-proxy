@@ -158,25 +158,22 @@ async function pushRelayIp() {
   }).catch((err) => logger(`catcher_wake_watcher: push failed: ${err}`));
 }
 
-interface Connection {
+export interface Connection {
   conn: string; // Peer Address:Port
   totalBytes: number; // bytes_acked (sent) + bytes_received, from ss -ti's per-connection info line
 }
 
-function currentConnections(): Connection[] {
-  let out: string;
-  try {
-    // -i adds a second, indented "info" line per connection with byte counters
-    // (bytes_acked, bytes_received among others), which state/established alone
-    // doesn't expose.
-    out = execFileSync("ss", ["-tin", "state", "established", "( sport = :25565 )"], {
-      encoding: "utf8",
-    });
-  } catch {
-    return [];
-  }
-
-  const lines = out.split("\n");
+// Pure parse of `ss -tin`'s two-line-per-connection output (a summary line, then an
+// indented info line carrying byte counters), split out so it's testable without
+// shelling out (see catcher_wake_watcher.test.ts). `lines.slice(1)` drops `ss`'s own
+// header line ("Recv-Q Send-Q Local Address:Port Peer Address:Port ..." -- `ss`
+// suppresses the State column entirely when filtering to a single state via
+// `state established`, confirmed live in relay/idle_shutdown.ts's own investigation,
+// so there's no leading "State"/"ESTAB" text here), which starts with a non-space
+// character just like a real connection's summary line and would otherwise be
+// misread as one.
+export function parseConnections(ssOutput: string): Connection[] {
+  const lines = ssOutput.split("\n");
   const connections: Connection[] = [];
   let pendingConn: string | null = null;
 
@@ -199,8 +196,30 @@ function currentConnections(): Connection[] {
   return connections;
 }
 
+function currentConnections(): Connection[] {
+  let out: string;
+  try {
+    // -i adds a second, indented "info" line per connection with byte counters
+    // (bytes_acked, bytes_received among others), which state/established alone
+    // doesn't expose.
+    out = execFileSync("ss", ["-tin", "state", "established", "( sport = :25565 )"], {
+      encoding: "utf8",
+    });
+  } catch {
+    return [];
+  }
+  return parseConnections(out);
+}
+
 function isLoopback(conn: string): boolean {
   return conn.startsWith("127.0.0.1:") || conn.startsWith("[::1]:") || conn.startsWith("[::ffff:127.0.0.1]:");
+}
+
+// Pure "is this persistence + byte growth enough to call it a real player" decision,
+// split out so it's testable without driving fake `ss` polls through the whole tick
+// loop (see catcher_wake_watcher.test.ts).
+export function shouldTriggerWake(streak: number, grownBytes: number, confirmCount: number, minActivityBytes: number): boolean {
+  return streak >= confirmCount && grownBytes >= minActivityBytes;
 }
 
 async function tick() {
@@ -217,7 +236,7 @@ async function tick() {
 
     if (existing.streak >= CONFIRM_COUNT && !triggered.has(conn)) {
       const grown = totalBytes - existing.firstSeenBytes;
-      if (grown >= MIN_ACTIVITY_BYTES) {
+      if (shouldTriggerWake(existing.streak, grown, CONFIRM_COUNT, MIN_ACTIVITY_BYTES)) {
         triggered.add(conn);
         logger(
           `catcher_wake_watcher: ${conn} persisted ${existing.streak} polls (~${existing.streak * (POLL_MS / 1000)}s) and exchanged ${grown} bytes, checking relay`,
@@ -240,7 +259,15 @@ async function tick() {
   }
 }
 
-while (true) {
-  await tick();
-  await Bun.sleep(POLL_MS);
+// Guarded so importing this module (see catcher_wake_watcher.test.ts) doesn't kick off
+// the live poll loop itself: import.meta.main is only true when this file is bun's
+// actual entry point (the live watcher), not when another module imports it for its
+// exported functions. Without this guard, a top-level `await` inside the loop would
+// never resolve, hanging the test file's own module import indefinitely. Same pattern
+// already established in relay/idle_shutdown.ts for the same reason.
+if (import.meta.main) {
+  while (true) {
+    await tick();
+    await Bun.sleep(POLL_MS);
+  }
 }
