@@ -28,16 +28,29 @@ function logger(message: string) {
   }
 }
 
-function establishedCount(): number {
+// Filter matches catcher_wake_watcher.ts's own `sport = :PORT` check (confirmed live
+// there, including behind a load balancer). This used to also OR in `dport = :PORT`,
+// untested and unverified live, unlike catcher's version, until confirmed live
+// 2026-07-22: a player actively connected and chatting through the relay still got
+// powered off out from under them, and returning 0 (not throwing) is exactly what
+// "the extra dport clause broke the compound `ss` filter expression" would look like
+// from here. Returns null (not 0) when the check itself throws, so a broken `ss`
+// invocation can't be silently misread as "confirmed no players": a failed check now
+// counts as "assume active" rather than "assume idle", since the destructive action
+// (poweroff) should never fire on a check we couldn't actually run. Every tick's raw
+// result is logged too, so the next occurrence is diagnosable from the journal alone
+// instead of requiring live GCE forensics like this one did.
+function establishedCount(): number | null {
   try {
     const out = execFileSync(
       "ss",
-      ["-tn", "state", "established", `( sport = :${MC_PORT} or dport = :${MC_PORT} )`],
+      ["-tn", "state", "established", `( sport = :${MC_PORT} )`],
       { encoding: "utf8" },
     );
     return out.split("\n").filter((line) => line.includes("ESTAB")).length;
-  } catch {
-    return 0;
+  } catch (err) {
+    logger(`relay: idle check's \`ss\` invocation failed (${err}), treating as active this tick`);
+    return null;
   }
 }
 
@@ -48,8 +61,11 @@ function bedrockActive(now: number): boolean {
 }
 
 const now = Math.floor(Date.now() / 1000);
+const tcpCount = establishedCount();
+const bedrock = bedrockActive(now);
+logger(`relay: idle check tick, tcpCount=${tcpCount === null ? "check-failed" : tcpCount}, bedrockActive=${bedrock}`);
 
-if (establishedCount() > 0 || bedrockActive(now)) {
+if (tcpCount === null || tcpCount > 0 || bedrock) {
   writeFileSync(STATE_FILE, String(now));
   process.exit(0);
 }
