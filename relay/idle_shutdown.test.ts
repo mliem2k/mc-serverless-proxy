@@ -32,6 +32,17 @@ describe("parseEstablishedCount", () => {
     expect(parseEstablishedCount(output)).toBe(0);
   });
 
+  test("garbage input does not throw", () => {
+    // parseEstablishedCount trusts ss's structure (line 1 is always the header when
+    // filtering to a single state), not the content of each row, that's the actual
+    // fix: counting non-blank rows instead of matching text ss never guarantees. So
+    // multi-line garbage legitimately counts every line past the first, by design,
+    // this only asserts the robustness property (no throw), not a specific count.
+    expect(() => parseEstablishedCount("not ss output at all\n***\nmore garbage")).not.toThrow();
+    // Single-line garbage has nothing left after the header is dropped.
+    expect(parseEstablishedCount("just one garbage line")).toBe(0);
+  });
+
   test("trailing blank line from a trailing newline is not counted as a connection", () => {
     const output = [
       "Recv-Q Send-Q  Local Address:Port   Peer Address:Port Process",
