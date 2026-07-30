@@ -48,6 +48,45 @@ function readToken(): string {
   return token;
 }
 
+// Raised from 5 on 2026-07-30. Five attempts at a 3s backoff is only ~15s of tolerance,
+// and relay-ddns.service had no restart policy, so a boot whose outbound egress took
+// longer than that would lose the DNS update for the whole relay session. Defensive: this
+// was NOT the cause of the 2026-07-30 fast-route failure, that boot's update succeeded.
+const ATTEMPTS = 10;
+const VERIFY_BUDGET_MS = 120_000;
+const VERIFY_INTERVAL_MS = 5_000;
+
+// A `success: true` from Cloudflare's API only proves the record was accepted, NOT that
+// resolvers are handing out the new answer. The consumer that actually matters here,
+// home-server/join_transfer_watcher.ts's readiness gate, reads this name over Cloudflare
+// DoH and refuses to transfer anyone while it still sees catcher's IP. So an accepted-but-
+// not-yet-served record is functionally identical to no update at all, and used to be
+// indistinguishable from success in this script's own logs. Verify through the exact same
+// path the gate uses, and treat unverified as failure so the unit's Restart=on-failure
+// gets another go instead of leaving a silently-wrong record for the session.
+async function resolvesToTarget(): Promise<boolean> {
+  try {
+    const res = await fetch(
+      `https://cloudflare-dns.com/dns-query?name=${fqdn}&type=A`,
+      { headers: { accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) },
+    );
+    const json = (await res.json()) as { Answer?: Array<{ type: number; data: string }> };
+    return json.Answer?.some((a) => a.type === 1 && a.data === ip) ?? false;
+  } catch {
+    return false;
+  }
+}
+
+async function verifyPropagated(): Promise<boolean> {
+  const deadline = Date.now() + VERIFY_BUDGET_MS;
+  for (;;) {
+    if (await resolvesToTarget()) return true;
+    if (Date.now() + VERIFY_INTERVAL_MS >= deadline) return false;
+    logger(`cf_dns_update(${name}): waiting for DoH to serve ${ip}`);
+    await Bun.sleep(VERIFY_INTERVAL_MS);
+  }
+}
+
 async function getZoneId(token: string): Promise<string | null> {
   if (existsSync(zoneIdCache)) {
     const cached = readFileSync(zoneIdCache, "utf8").trim();
@@ -73,7 +112,7 @@ async function getZoneId(token: string): Promise<string | null> {
 async function run() {
   const token = readToken();
 
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= ATTEMPTS; attempt++) {
     const zoneId = await getZoneId(token);
     if (!zoneId) {
       logger(`cf_dns_update(${name}): attempt ${attempt} failed fetching zone id, retrying in 3s`);
@@ -120,15 +159,22 @@ async function run() {
     }
 
     if (resp.success) {
-      logger(`cf_dns_update(${name}): updated to ${ip}`);
-      process.exit(0);
+      if (await verifyPropagated()) {
+        logger(`cf_dns_update(${name}): updated to ${ip} (verified via DoH)`);
+        process.exit(0);
+      }
+      logger(
+        `cf_dns_update(${name}): ERROR API accepted ${ip} but DoH never served it within ` +
+          `${VERIFY_BUDGET_MS / 1000}s, exiting non-zero so the unit's Restart=on-failure retries`,
+      );
+      process.exit(1);
     }
 
     logger(`cf_dns_update(${name}): attempt ${attempt} failed: ${JSON.stringify(resp)}`);
     await Bun.sleep(3000);
   }
 
-  logger(`cf_dns_update(${name}): ERROR giving up on ${name} after 5 attempts`);
+  logger(`cf_dns_update(${name}): ERROR giving up on ${name} after ${ATTEMPTS} attempts`);
   process.exit(1);
 }
 

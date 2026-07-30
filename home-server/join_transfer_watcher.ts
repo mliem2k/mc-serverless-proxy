@@ -29,6 +29,7 @@
 // state to coordinate. The one tradeoff is the cooldown resets if this watcher itself
 // restarts, an acceptable, rare edge case.
 import { execFileSync, spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const LOG = "/path/to/your/server/logs/latest.log";
@@ -44,6 +45,7 @@ const BACKEND_HOST = "mc-backend.YOURDOMAIN.com";
 // "transfer" was a same-catcher loopback, and the player saw "you're now on the fast
 // route" while still actually being served through catcher (confirmed live 2026-07-18).
 const CATCHER_IP = "YOUR_CATCHER_STATIC_IP";
+const FRPC_CONFIG = "/etc/frp/frpc.toml";
 
 // PufferPanel console access for /xferlobby start|cancel, the same login-then-POST
 // pattern transfer_one.ts uses for /xfer. Kept in-process here (rather than shelling
@@ -72,6 +74,21 @@ async function resolveBackend(): Promise<string | null> {
     const json = (await res.json()) as { Answer?: Array<{ type: number; data: string }> };
     const answer = json.Answer?.find((a) => a.type === 1);
     return answer?.data ?? null;
+  } catch {
+    return null;
+  }
+}
+
+// frpc.toml's serverAddr is maintained by relay_ip_push_listener.ts, which learns the
+// relay's current IP over catcher's direct push channel rather than via DNS. That path is
+// both faster and independent of Cloudflare: on 2026-07-30 it had the address 2s after the
+// relay's start was requested and the tunnel up 30s in, while the DNS record stayed on
+// catcher for the entire session. Reading it here is purely diagnostic; it is deliberately
+// NOT used as a transfer target, because the transfer goes out by hostname (see doTransfer).
+function localRelayAddr(): string | null {
+  try {
+    const toml = readFileSync(FRPC_CONFIG, "utf8");
+    return toml.match(/^\s*serverAddr\s*=\s*"([^"]+)"/m)?.[1] ?? null;
   } catch {
     return null;
   }
@@ -125,7 +142,30 @@ async function checkRelayReady(): Promise<string | null> {
   const ip = await resolveBackend();
   if (!ip) return null;
   if (ip === CATCHER_IP) {
-    logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
+    // Distinguish "relay genuinely isn't up yet" from "relay IS up and the tunnel is live,
+    // but this box's resolver is still handing back the stale answer". Those look identical
+    // through DNS alone, and conflating them cost a long investigation on 2026-07-30.
+    //
+    // The second case is the known killer, and it is a caching problem, NOT a failed DDNS:
+    // on 2026-07-30 the relay's update provably succeeded at 06:54:11Z, yet all 24 of this
+    // loop's polls (14:53:34 to 14:55:30 CST) still got catcher's IP, so the gate never
+    // opened and the player was dumped to the slow path 84s after the tunnel went live.
+    // Reproduced 2026-07-30: after patching the record, DoH answers from here FLAP between
+    // old and new for over a minute even though only one authoritative record exists,
+    // because cloudflare-dns.com is anycast and each node caches independently, and polling
+    // every 5s spreads the query across many of them. A freshly created name converged in
+    // 5.2s; this heavily-polled one did not. Hence: never conclude "DDNS failed" from this.
+    const local = localRelayAddr();
+    if (local && local !== CATCHER_IP) {
+      logger(
+        `join_transfer_watcher: mc-backend still resolves to catcher (${ip}) BUT frpc is already ` +
+          `pointed at the relay (${local}), so the relay is UP and the tunnel is live; this is our ` +
+          `resolver serving a stale cached answer, not a DDNS failure. Cannot transfer by hostname ` +
+          `until the record propagates here (see the static-IP note in the README).`,
+      );
+    } else {
+      logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
+    }
     return null;
   }
   return isReachable(ip) ? ip : null;
