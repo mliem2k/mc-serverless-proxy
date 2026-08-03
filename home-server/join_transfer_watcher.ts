@@ -138,9 +138,16 @@ async function sendConsoleCommand(command: string): Promise<void> {
 // catcher, a same-catcher loopback that tells them they're on the fast route while they
 // aren't (real bug, fixed 2026-07-18, preserved here as its own helper so restructuring
 // handleJoin can't accidentally drop it again).
-async function checkRelayReady(): Promise<string | null> {
+// ip is non-null only when the relay is genuinely transferable-to right now. tunnelLive is
+// the weaker, earlier signal: the relay is up and frpc is pointed at it, but the hostname we
+// transfer by hasn't propagated to this box's resolver yet. That gap is the single longest
+// phase of a cold start (about 30s of the measured 68s on 2026-08-03), and it is exactly when
+// the lobby progress bar most needs something real to report.
+type RelayCheck = { ip: string | null; tunnelLive: boolean };
+
+async function checkRelayReady(): Promise<RelayCheck> {
   const ip = await resolveBackend();
-  if (!ip) return null;
+  if (!ip) return { ip: null, tunnelLive: false };
   if (ip === CATCHER_IP) {
     // Distinguish "relay genuinely isn't up yet" from "relay IS up and the tunnel is live,
     // but this box's resolver is still handing back the stale answer". Those look identical
@@ -163,12 +170,12 @@ async function checkRelayReady(): Promise<string | null> {
           `resolver serving a stale cached answer, not a DDNS failure. Cannot transfer by hostname ` +
           `until the record propagates here (see the static-IP note in the README).`,
       );
-    } else {
-      logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
+      return { ip: null, tunnelLive: true };
     }
-    return null;
+    logger(`join_transfer_watcher: mc-backend still resolves to catcher (${ip}), relay not woken/ready yet, waiting`);
+    return { ip: null, tunnelLive: false };
   }
-  return isReachable(ip) ? ip : null;
+  return isReachable(ip) ? { ip, tunnelLive: true } : { ip: null, tunnelLive: false };
 }
 
 // The readiness check resolves and dials the IP directly (it needs a real socket to
@@ -200,9 +207,23 @@ async function handleJoin(player: string) {
   }
   logger(`join_transfer_watcher: ${player} joined, checking relay readiness`);
 
-  const firstIp = await checkRelayReady();
-  if (firstIp) {
-    await doTransfer(player, firstIp);
+  // Sent at most once per wait. A failure here only costs this player a smoother progress
+  // bar, so it must never interrupt the poll loop that actually transfers them.
+  let readyReported = false;
+  const reportReady = async () => {
+    if (readyReported) return;
+    readyReported = true;
+    try {
+      await sendConsoleCommand(`xferlobby ${player} ready`);
+      logger(`join_transfer_watcher: reported relay-ready to the lobby bar for ${player}`);
+    } catch (err) {
+      logger(`join_transfer_watcher: failed to report relay-ready for ${player}: ${err}`);
+    }
+  };
+
+  const first = await checkRelayReady();
+  if (first.ip) {
+    await doTransfer(player, first.ip);
     return;
   }
 
@@ -215,9 +236,12 @@ async function handleJoin(player: string) {
   // 23 attempts x 5s ~= 2min total budget, matching the log messages below.
   for (let i = 0; i < 23; i++) {
     await Bun.sleep(5000);
-    const ip = await checkRelayReady();
-    if (ip) {
-      await doTransfer(player, ip);
+    const check = await checkRelayReady();
+    // Deliberately before the transfer check: on the poll where both become true at once the
+    // bar still gets its jump to full, and reporting is cheap enough not to delay anything.
+    if (check.tunnelLive) await reportReady();
+    if (check.ip) {
+      await doTransfer(player, check.ip);
       return;
     }
   }
