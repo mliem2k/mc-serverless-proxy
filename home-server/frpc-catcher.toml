@@ -36,15 +36,3 @@ type = "tcp"
 localIP = "127.0.0.1"
 localPort = 19133
 remotePort = 19133
-
-# Carries catcher_wake_watcher.ts's push of the relay's current IP straight to
-# relay_ip_push_listener.ts here, bypassing DNS propagation delay (measured live
-# 2026-07-18 at 31.5s-63.4s, the single biggest chunk of end-to-end transfer
-# latency). Same reasoning as udp-relay-control above: this needs to always be
-# reachable from catcher, not just while the dynamic tunnel happens to point there.
-[[proxies]]
-name = "relay-ip-push"
-type = "tcp"
-localIP = "127.0.0.1"
-localPort = 19134
-remotePort = 19134

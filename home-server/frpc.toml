@@ -1,9 +1,16 @@
-# The DYNAMIC tunnel: serverAddr follows wherever mc-backend currently resolves
-# (catcher normally, the relay once it's woken and warm), see
-# home-server/frpc_resolve_loop.ts. Proxies here only need to be reachable while
-# THIS specific target is active, unlike home-server/frpc-catcher.toml's proxies,
-# which need catcher specifically, always, regardless of where this file points.
-serverAddr = "YOUR_RELAY_CURRENT_IP"
+# The RELAY tunnel: serverAddr is the relay's permanent static IP, which lives on a
+# passthrough NLB forwarding rule rather than the VM's own network interface, so the
+# address stays valid and reserved even while the relay VM is stopped. Proxies here
+# only need to be reachable while the relay is actually up, unlike
+# home-server/frpc-catcher.toml's proxies, which need catcher specifically, always.
+#
+# Nothing rewrites this file any more. It used to be rewritten on every relay boot,
+# because the relay's address was ephemeral and changed each time: frpc_resolve_loop.ts
+# polled DNS for it and relay_ip_push_listener.ts took a direct push from catcher to
+# beat DNS. Both existed solely to chase a moving address, and both are gone. On a cold
+# start frpc's own reconnect loop now closes the gap in about a second, against a target
+# it already knows, instead of waiting 30-75s for a public DNS record to propagate.
+serverAddr = "YOUR_RELAY_STATIC_IP"
 serverPort = 7000
 auth.method = "token"
 auth.token = "REPLACE_ME"

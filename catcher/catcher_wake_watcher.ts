@@ -44,10 +44,6 @@ const POLL_MS = 1000;
 // under 8KB), comfortably below what real login + config-phase traffic produces within
 // a couple of seconds of a genuine connection.
 const MIN_ACTIVITY_BYTES = 16384;
-// Shared secret with home-server/relay_ip_push_listener.ts, reachable via frpc.toml's
-// "relay-ip-push" proxy (127.0.0.1:19134 here forwards straight to the same port
-// there). See pushRelayIp() below for why this exists.
-const PUSH_TOKEN = process.env.RELAY_IP_PUSH_TOKEN || "REPLACE_ME";
 
 interface ConnState {
   streak: number;
@@ -103,59 +99,6 @@ async function triggerWake() {
     { method: "POST", headers: { Authorization: `Bearer ${token}` } },
   );
   logger(`catcher_wake_watcher: ${await res.text()}`);
-  void pushRelayIp();
-}
-
-// Polls the GCE API directly for the relay's assigned external IP and pushes it to
-// relay_ip_push_listener.ts on the home server as soon as it's known, bypassing DNS
-// entirely for the home server's frpc reconnect (relay/relay_boot_ddns.ts still
-// updates DNS separately, for new players resolving mc.YOURDOMAIN.com fresh, that
-// path is unaffected). Runs without blocking the main connection-watching loop.
-// home-server/frpc_resolve_loop.ts keeps running unmodified as a slower DNS-based
-// backstop in case this push is ever missed.
-//
-// Deliberately does NOT wait for the relay's frps to actually accept a connection
-// before pushing, even though GCE assigns the external IP well before the guest OS
-// finishes booting (confirmed ~3.5s after triggering wake, versus frps not starting
-// until ~30s+ in). A first attempt at that readiness gate tested TCP connectivity
-// to the relay's port 7000 directly FROM CATCHER, which turned out to be the wrong
-// place to test it from: confirmed live 2026-07-19, catcher genuinely cannot reach
-// the relay's IP cross-region on that port at all (a real, persistent network
-// topology fact, not a bug or transient flakiness), while the home server can,
-// every time. That readiness check silently hung forever on catcher, and this
-// script has no visibility into the home server's own network reachability anyway.
-// The right fix is to gate readiness on the side that can actually observe it: see
-// home-server/relay_ip_push_listener.ts, which now does the same "wait for frps to
-// accept a connection" check itself, from the home server, before touching
-// frpc.toml or restarting frpc.
-async function pushRelayIp() {
-  const token = await gcpToken();
-  if (!token) return;
-
-  let ip: string | null = null;
-  for (let i = 0; i < 60; i++) {
-    const res = await fetch(
-      `https://compute.googleapis.com/compute/v1/projects/${PROJECT}/zones/${ZONE}/instances/${INSTANCE}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
-    const json = (await res.json()) as {
-      networkInterfaces?: Array<{ accessConfigs?: Array<{ natIP?: string }> }>;
-    };
-    ip = json.networkInterfaces?.[0]?.accessConfigs?.[0]?.natIP ?? null;
-    if (ip) break;
-    await Bun.sleep(1000);
-  }
-  if (!ip) {
-    logger("catcher_wake_watcher: relay's external IP never became available within 60s, DNS-based detection will still catch up");
-    return;
-  }
-
-  logger(`catcher_wake_watcher: relay's external IP is ${ip}, pushing to home server`);
-  await fetch("http://127.0.0.1:19134", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ token: PUSH_TOKEN, ip }),
-  }).catch((err) => logger(`catcher_wake_watcher: push failed: ${err}`));
 }
 
 export interface Connection {

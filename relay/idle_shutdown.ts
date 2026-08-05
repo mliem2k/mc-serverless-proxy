@@ -9,7 +9,6 @@ import { existsSync, readFileSync, writeFileSync } from "node:fs";
 
 const IDLE_LIMIT_SECONDS = 300;
 const STATE_FILE = "/var/run/mc-relay-last-connected";
-const CATCHER_IP = "YOUR_CATCHER_STATIC_IP";
 const MC_PORT = 25565;
 // Written by udp_relay_relay.ts whenever a real (not just a status ping) Bedrock
 // session is active. Without this, this check only ever looked at TCP port 25565,
@@ -112,16 +111,13 @@ if (import.meta.main) {
   const elapsed = now - lastSeen;
 
   if (shouldPowerOff(elapsed, IDLE_LIMIT_SECONDS)) {
-    logger(`relay: idle for ${elapsed}s (limit ${IDLE_LIMIT_SECONDS}s), flipping DNS back to catcher and shutting down`);
-    // Both records need resetting, not just the public-facing "mc" one. "mc-backend" is
-    // what the home server's DNS-change watcher uses to decide where to point its
-    // tunnel, and what the join watcher checks for relay reachability. Leaving it
-    // pointed at this now-dead relay IP after shutdown means the tunnel keeps dialing a
-    // dead address indefinitely once it eventually re-resolves (confirmed live: this
-    // broke the home server's tunnel entirely after a relay wake/sleep cycle, until
-    // fixed by hand).
-    execFileSync("bun", ["run", `${import.meta.dir}/cf_dns_update.ts`, "mc", CATCHER_IP], { stdio: "inherit" });
-    execFileSync("bun", ["run", `${import.meta.dir}/cf_dns_update.ts`, "mc-backend", CATCHER_IP], { stdio: "inherit" });
+    logger(`relay: idle for ${elapsed}s (limit ${IDLE_LIMIT_SECONDS}s), shutting down`);
+    // No DNS work here any more. This VM now sits behind a permanent static IP on a
+    // passthrough NLB forwarding rule, so mc-backend points at that one address forever
+    // and is correct whether this VM is running or stopped. Both records used to be
+    // flipped back to catcher here, which was the other half of a propagation race that
+    // cost 30-75s of every cold start (and left a window where a player could resolve a
+    // relay address that had already powered off).
     execFileSync("/sbin/poweroff");
   }
 }

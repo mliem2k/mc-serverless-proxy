@@ -51,10 +51,10 @@ idle cost down to essentially nothing.
 
 ```mermaid
 flowchart TD
-    Player[Player] --> DNS["DNS: mc.yourdomain.com"]
+    Player[Player] --> DNS["DNS: mc.yourdomain.com<br/>permanent, always catcher"]
     DNS --> Catcher["Catcher VM<br/>always on, permanent tunnel"]
     Catcher -- "instant connect" --> Home["Home server<br/>via frpc"]
-    Catcher -- "wake watcher: new connection persists 9s+" --> Relay["Relay VM<br/>on-demand, low-latency region"]
+    Catcher -- "wake watcher: real player, not a ping" --> Relay["Relay VM<br/>on-demand, low-latency region<br/>permanent static IP"]
     Relay -- "once ready: Minecraft Transfer packet" --> Player
     Relay -- "tunnel" --> Home
 ```
@@ -63,9 +63,10 @@ flowchart TD
   a permanent tunnel straight to your home server, and is the one thing that's always
   reachable. Also watches for new connections and wakes the relay when one looks real.
 - **Relay**: a VM in whatever region you actually want low latency for. Stopped by
-  default. Boots on demand, points DNS at itself, tunnels to your home server the same
-  way catcher does, and shuts itself back down (flipping DNS back to catcher first)
-  within 5 minutes of the last player disconnecting.
+  default. Boots on demand, tunnels to your home server the same way catcher does, and
+  shuts itself back down within 5 minutes of the last player disconnecting. It keeps a
+  permanent static IP across all of that, so no DNS ever changes and nothing has to wait
+  for a record to propagate.
 - **Home server**: your actual Minecraft server. Watches its own join log, and once the
   relay is confirmed reachable (a real Minecraft protocol handshake, not just a TCP
   connect), uses [XferHelper](https://github.com/mliem2k/XferHelper) (included here as
@@ -81,8 +82,9 @@ any other server-side transfer.
 Running a second region's VM around the clock is the obvious approach and the wrong
 one for a low-traffic personal server: you're paying full-time compute for a resource
 used a few hours a week. `catcher/catcher_wake_watcher.ts` watches for a connection
-that persists 9+ seconds (long enough to rule out a status ping or health check, short
-enough that players don't notice) and wakes the relay through GCP's Compute API,
+that both persists across consecutive polls and moves real login traffic (see the port
+scanner section below for why persistence alone is not enough), then wakes the relay
+through GCP's Compute API,
 authenticated via the VM's own metadata-server service account token, no static
 credentials involved.
 
@@ -154,49 +156,85 @@ deliberately pushes junk bytes past the threshold without being a real client co
 still trigger a false wake. That's an accepted, low-cost residual risk, one relay boot
 cycle, a few cents, given how much more specific a fake now has to be.
 
-## The false "fast route" bug, and why DNS is out of the reconnect critical path
+## Giving the relay the same free static IP, and deleting DNS from the critical path
 
-`join_transfer_watcher.ts` decides a player can be transferred once `mc-backend`
-resolves to something that answers a real Minecraft handshake. That check has a hole:
-catcher's own tunnel is permanently up, so whenever the relay hasn't been woken yet (or
-has idled back down), `mc-backend` still points at catcher and trivially passes the
-same check. Confirmed live 2026-07-18: a fast-joining test client got "transferred" to
-`mc-backend` within 3.2s of joining, well under the wake watcher's own ~9s detection
-window (meaning no wake had even fired), and saw a "you're now on the fast route"
-message while still actually on catcher, a same-target loopback, not a real handoff.
-Fixed by excluding catcher's own static IP from the check (see `CATCHER_IP` in
-`join_transfer_watcher.ts`): a transfer only fires once `mc-backend` resolves to
-something that *isn't* catcher and answers a real handshake.
+The relay originally used an ephemeral external IP, on the reasoning that an address is
+only needed while the VM is running. That one decision produced most of the complexity
+in this repo and its single worst failure mode, so it is worth spelling out how it
+unravelled and what replaced it.
 
-Measuring the real cold-start path after that fix (client-observed + `journalctl -f` on
-both ends + 1s GCE status polling, from a genuinely `TERMINATED` relay) found the single
-biggest chunk wasn't the relay's own boot time, it was `frpc_resolve_loop.ts` waiting on
-Cloudflare DNS propagation to notice the relay's new IP: 31.5s-63.4s of real, highly
-variable added latency in different runs, dwarfing GCP's own provisioning (~11-12s) and
-the guest OS boot (~17.5s, matched cold vs warm). Tightening that loop's poll interval
-didn't help, since polling faster than the underlying DNS answer actually settles just
-means catching Cloudflare's own edge network disagreeing with itself right after a
-write (different PoPs briefly serving the old vs new answer), each disagreement misread
-as "the IP changed *again*" and re-triggering a restart. Confirmed live: 1s polling
-produced a real frpc flap loop (7 restarts in 19 seconds).
+Because the address changed on every boot, something had to discover the new one and
+tell the home server. That was `frpc_resolve_loop.ts`, polling Cloudflare DNS. Measuring
+a real cold start (client-observed, plus `journalctl -f` on both ends, plus 1s GCE status
+polling, from a genuinely `TERMINATED` relay) showed the biggest phase was not the
+relay's boot at all, it was that DNS wait: 31.5s to 63.4s, dwarfing GCP's provisioning
+(~11-12s) and the guest OS boot (~17.5s). Polling faster made it worse, not better,
+because it caught Cloudflare's own edge disagreeing with itself right after a write,
+each disagreement misread as "the IP changed *again*". Confirmed live: 1s polling
+produced a real frpc flap loop, 7 restarts in 19 seconds.
 
-The actual fix: `catcher_wake_watcher.ts`'s `pushRelayIp()` asks the GCE API directly
-for the relay's assigned external IP (available seconds after boot starts, well before
-DNS propagation would ever show it) and pushes it straight to
-`home-server/relay_ip_push_listener.ts` over `frpc.toml`'s `relay-ip-push` proxy,
-bypassing DNS for this path entirely. That still isn't quite enough on its own: GCE
-assigns the external IP as an infrastructure-level resource *before* the guest OS even
-finishes booting, so pushing the instant it's assigned raced the relay's own `frps`
-starting up, producing the same kind of premature-reconnect failure DNS timing could
-also cause (confirmed live both ways: a transferred client hit a real `ECONNREFUSED`).
-Both `pushRelayIp()` and `frpc_resolve_loop.ts`'s restart now wait for the relay's frps
-control port (7000) to actually accept a connection before touching `frpc.toml`, so the
-reconnect only ever gets attempted once the target is genuinely ready. `frpc_resolve_loop.ts`
-stays on its original conservative 5s/2-confirm-reads poll as a slow backstop for
-whenever the push is ever missed, it's no longer the fast path.
+The first fix went around DNS rather than removing it. `catcher_wake_watcher.ts` asked
+the GCE API for the relay's assigned address (available seconds after boot starts) and
+pushed it straight to `relay_ip_push_listener.ts` on the home server. That helped the
+tunnel, roughly 53-55s instead of 70-77s, but it could not help the *transfer*, because
+the transfer goes out by hostname (TransferTool's Bedrock mappings are static config
+keyed on host:port) and a hostname still has to propagate. On 2026-07-30 that gate never
+opened at all: the relay's DNS update provably succeeded, yet all 24 of the watcher's
+polls still read catcher, and a real player was dumped onto the slow path 84s after the
+tunnel had gone live. Two measured cold starts on 2026-08-03 spent 30s and 75s
+respectively in nothing but propagation, on identical infrastructure minutes apart.
 
-Net result measured live, same cold-start conditions: ~53-55s instead of ~70-77s, no
-flapping, no false "fast route" transfers.
+The actual fix is to stop the address from moving. GCP exempts a static IP attached to a
+**load balancer forwarding rule** from the per-address charge (the same exemption cheat
+#2 above already uses for catcher), and that exemption does not care whether the backend
+VM is running. So the relay gets the identical treatment: a reserved address on a
+passthrough NLB forwarding rule, which stays valid and reserved while the VM is stopped,
+at no charge beyond data processing. `catcher/setup-load-balancer.ts` is the same recipe;
+for the relay it is:
+
+```
+gcloud compute addresses create mc-relay-ip --region=$REGION
+gcloud compute health-checks create tcp mc-relay-hc --region=$REGION --port=7000 \
+  --check-interval=10s --timeout=5s --healthy-threshold=2 --unhealthy-threshold=3
+gcloud compute instance-groups unmanaged create mc-relay-ig --zone=$ZONE
+gcloud compute instance-groups unmanaged add-instances mc-relay-ig --zone=$ZONE \
+  --instances=$RELAY_INSTANCE
+gcloud compute backend-services create mc-relay-backend --region=$REGION \
+  --load-balancing-scheme=EXTERNAL --protocol=TCP \
+  --health-checks=mc-relay-hc --health-checks-region=$REGION
+gcloud compute backend-services add-backend mc-relay-backend --region=$REGION \
+  --instance-group=mc-relay-ig --instance-group-zone=$ZONE
+gcloud compute forwarding-rules create mc-relay-fr --region=$REGION \
+  --load-balancing-scheme=EXTERNAL --ip-protocol=TCP --ports=25565,7000 \
+  --address=mc-relay-ip --backend-service=mc-relay-backend --backend-service-region=$REGION
+```
+
+Repeat the backend-service and forwarding-rule pair with `--protocol=UDP` /
+`--ip-protocol=UDP --ports=19132` for Bedrock, exactly as catcher does. Health-check
+traffic comes from `35.191.0.0/16` and `130.211.0.0/22`, so those need to reach port 7000.
+
+With the address fixed, the two DNS records become permanent and opposite:
+`mc` points at catcher forever (the entry point, always up), and `mc-backend` points at
+the relay forever (the tunnel target and the transfer target). Nothing writes DNS at
+runtime any more. That deleted, in one go: `relay_boot_ddns.ts`, `cf_dns_update.ts`,
+`relay-ddns.service`, the DNS flip-back inside `idle_shutdown.ts`, `frpc_resolve_loop.ts`,
+`relay_ip_push_listener.ts`, the `relay-ip-push` frp proxy, and `pushRelayIp()` in
+`catcher_wake_watcher.ts`. `frpc.toml`'s `serverAddr` is now simply the relay's address,
+and frpc's own reconnect loop closes the cold-start gap in about a second.
+
+One earlier bug is worth keeping in mind, because the fix above is also what makes it
+structurally impossible. Confirmed live 2026-07-18: a fast-joining test client got
+"transferred" within 3.2s of joining, before any wake had fired, and saw "you're now on
+the fast route" while still on catcher, because `mc-backend` still resolved to catcher
+and catcher trivially answers a real handshake. That was originally patched by excluding
+catcher's IP from the check. Now the readiness check dials the relay's own fixed address
+directly, so catcher can never be mistaken for the relay. `assertTransferTargetMatches()`
+in `join_transfer_watcher.ts` additionally checks at startup that `mc-backend` really
+resolves to the address readiness was tested against, since "health-check one endpoint,
+hand the player another" is precisely the shape of that bug.
+
+Measured effect: the propagation phase, 30-75s of every cold start and the largest single
+component of it, is gone outright.
 
 ## Bedrock/mobile cross-play, and frp's broken UDP proxy
 
@@ -241,9 +279,11 @@ everything on it survives) and re-adding it to the load balancer's instance grou
 with the same name does not re-add it automatically).
 
 **TransferTool's mapping has to be by hostname, not IP.** It rewrites the Java
-Transfer packet's destination using a static config, matched against `host:port`, but
-the relay's IP changes on every boot (see `relay/relay_boot_ddns.ts`). Map your DNS
-hostnames instead of whatever IP they currently resolve to, in
+Transfer packet's destination using a static config, matched against `host:port`. This
+mattered urgently back when the relay's IP changed on every boot, and it still matters
+now that it does not: the mapping is config, so pinning it to a literal address means
+editing plugin config the day you move regions or rebuild the VM. Map your DNS hostnames
+instead of whatever IP they currently resolve to, in
 `plugins/Geyser-Spigot/extensions/transfertool/config.yml`:
 
 ```yaml
@@ -303,19 +343,17 @@ hostnames Java already uses, no new player-facing address needed.
 
 - `catcher/` — the always-on entry point: `frps`, the wake watcher, the load balancer
   setup that gets its IP cost to $0, and the custom UDP relay for Bedrock.
-- `relay/` — the on-demand low-latency VM: `frps`, boot-time DNS update, the
-  systemd-timer-based idle shutdown (not cron, needs sub-minute precision), and its
-  own half of the Bedrock UDP relay.
+- `relay/` — the on-demand low-latency VM: `frps`, the systemd-timer-based idle
+  shutdown (not cron, needs sub-minute precision), and its own half of the Bedrock UDP
+  relay. It has a permanent static IP of its own, so there is no boot-time DNS update
+  here and no DNS work at shutdown either.
 - `home-server/` — runs on your actual Minecraft box: two separate `frpc` instances
-  (`frpc.service`/`frpc.toml`, the DYNAMIC tunnel that follows wherever the relay
-  currently is, and `frpc-catcher.service`/`frpc-catcher.toml`, a PERMANENT tunnel
-  always dialing catcher directly, for anything that needs to reach catcher
-  regardless of where the dynamic one currently points), the DNS-change watcher
-  (plus `relay_ip_push_listener.ts`, which shortcuts it via a direct push from
-  catcher) that keeps the dynamic tunnel pointed at wherever the relay currently is,
-  the join watcher that triggers transfers via XferHelper, and two instances of the
-  custom UDP relay's home-side half (one for catcher's Bedrock traffic, one for the
-  relay's).
+  (`frpc.service`/`frpc.toml` dialing the relay, and
+  `frpc-catcher.service`/`frpc-catcher.toml` dialing catcher), the join watcher that
+  triggers transfers via XferHelper, and two instances of the custom UDP relay's
+  home-side half (one for catcher's Bedrock traffic, one for the relay's). Both tunnels
+  now point at a fixed address and neither is ever rewritten at runtime; frpc's own
+  reconnect loop handles the relay being down.
 - `xferhelper/` — [XferHelper](https://github.com/mliem2k/XferHelper) as a git
   submodule, the Paper/Spigot/Purpur plugin that exposes the Transfer packet as a
   console command and freezes the player with a countdown while the switch happens.
@@ -414,8 +452,10 @@ three machines (catcher, relay, home server) before anything else.
    replacing every `YOUR_*`/`YOURDOMAIN` placeholder with your actual values. Each
    `.ts` file has a `#!/usr/bin/env bun` shebang and should be `chmod +x`'d, systemd
    invokes them directly, the same way it would a shell script.
-4. Point your DNS provider's API credentials at `relay/cf_dns_update.ts` (written for
-   Cloudflare; swap the `fetch` calls if you use something else).
+4. Create two permanent A records: one pointing at catcher's static IP (what players
+   connect to) and one pointing at the relay's static IP (the tunnel and transfer
+   target). Neither ever changes, so no DNS credentials are needed anywhere in this
+   setup at runtime.
 5. Install [XferHelper](https://github.com/mliem2k/XferHelper) on your home server
    (`git submodule update --init` here, then build and drop the jar in your plugins
    folder). Requires Paper/Spigot/Purpur 1.20.5+ for the Transfer packet.
