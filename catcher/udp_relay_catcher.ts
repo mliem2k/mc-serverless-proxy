@@ -31,15 +31,27 @@ import dgram from "node:dgram";
 import net from "node:net";
 
 const PUBLIC_UDP_PORT = Number(process.env.PUBLIC_UDP_PORT || 19132);
-// Bind directly to the load balancer's own IP, not 0.0.0.0. GCP's passthrough NLB
-// programs this address as a valid local route on the VM (confirmed: a plain bind()
-// to it succeeds), and replies sent from a socket natively bound here go out through
-// the normal kernel socket path GCP's SDN already expects, rather than an
-// iptables-SNAT'd packet after the fact, which never made it back to real clients
-// despite leaving the VM's own NIC correctly (confirmed live 2026-07-18: netfilter
-// processed and counted the SNAT, tcpdump inconsistently showed it on the wire, and it
-// never reached a real external client, pointing at GCP's own SDN not treating a
-// rewritten packet as part of the load balancer's expected return path).
+// 0.0.0.0 is correct for catcher's current setup: a plain 1:1 NAT static IP
+// on the VM's own access config, same as relay. The guest OS never sees the
+// external IP on any interface, GCP's SDN rewrites the destination to the
+// internal IP before the packet reaches the guest, so 0.0.0.0 (or the
+// internal IP) is the only address that can actually receive it.
+//
+// This used to need BIND_HOST set to the load balancer's own IP instead,
+// back when catcher sat behind one (see README, "Getting the idle cost to
+// (almost) $0"): GCP's passthrough NLB programs its forwarding rule's IP as
+// a valid local route on the backend VM specifically, which made binding to
+// that exact address work, and a reply sent from a socket natively bound
+// there went out through the kernel path GCP's SDN expected for the LB's
+// return traffic, rather than an iptables-SNAT'd packet after the fact,
+// which never made it back to real clients despite leaving the VM's own NIC
+// correctly (confirmed live 2026-07-18: netfilter processed and counted the
+// SNAT, tcpdump inconsistently showed it on the wire, and it never reached a
+// real external client). That NLB-specific local-route trick is the only
+// scenario where binding to a specific external IP (instead of 0.0.0.0)
+// works at all; catcher dropped the load balancer entirely (2026-08-17, it
+// turned out to cost more than the per-VM-IP charge it was avoiding), so
+// this reverted to the same 0.0.0.0 binding relay always used.
 const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 const CONTROL_HOST = process.env.CONTROL_HOST || "127.0.0.1"; // loops back through frp's own TCP tunnel to home
 const CONTROL_PORT = Number(process.env.CONTROL_PORT || 19133);

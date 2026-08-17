@@ -20,16 +20,20 @@ a couple of polling loops, and one specific GCP billing exemption:
    to be a serverless runtime, and it works because there's exactly one predictable
    thing being scaled (one game server's connection state), not because there's any
    real infrastructure underneath doing it for you.
-2. **A free static IP, faked with a load balancer.** GCP doesn't actually offer a free
-   external IP for an always-on VM (see below, it bills ~$3.65/month even on a
-   free-tier instance). The $0 catcher IP in this setup isn't free because GCP made it
-   free, it's free because a static IP attached to a *load balancer forwarding rule* is
-   billed differently than one attached to a VM's own network interface, and nothing
-   requires the backend behind that forwarding rule to be doing anything
-   load-balancer-shaped. One VM, one rule, same address, different billing category.
+2. ~~A free static IP, faked with a load balancer.~~ **Retired 2026-08-17, it made the
+   bill worse, not better.** GCP doesn't offer a free external IP for an always-on VM
+   (see below, it bills ~$3.65/month even on a free-tier instance), and a static IP
+   attached to a *load balancer forwarding rule* really is billed differently than one
+   attached to a VM's own network interface, that part of the trick is real. What
+   turned out not to be real: the forwarding rule itself carries its own per-hour
+   minimum charge, and on a live bill that minimum was *higher* than the $3.65/month
+   it was dodging. Catcher just uses a plain static IP on the VM now, same as relay
+   always has, no trick, ~$3.65/month, and that's genuinely the cheapest this
+   particular cost gets on GCP. See "Getting the idle cost to (almost) $0" below for
+   the full story, kept for context rather than deleted.
 
-Both tricks are legitimate, documented GCP behavior, not exploits, but they're exactly
-that: tricks. The honest description of this project is "ordinary VMs, DIY'd into
+The first trick is legitimate, documented GCP behavior, not an exploit. It's exactly
+that: a trick. The honest description of this project is "ordinary VMs, DIY'd into
 looking like a serverless bill," not "serverless infrastructure." If you want the real
 thing, a managed platform will genuinely scale to zero for you; you'll generally pay
 more for the privilege on a workload this small and predictable.
@@ -98,23 +102,58 @@ $3.65/month just for its own address.
 
 GCP has a separate, longstanding exemption: a static IP assigned to a **load balancer
 forwarding rule** isn't charged, only IPs attached directly to a VM's network
-interface are. `catcher/setup-load-balancer.ts` moves catcher's address off the VM
-and onto a passthrough Network Load Balancer forwarding rule pointed at the same VM.
-Nothing else changes: a passthrough NLB preserves the real client source IP at L3
-(confirmed live via `ss -tn` on the backend VM), so the wake watcher's connection
-detection needs zero changes, and DNS keeps pointing at the exact same address.
+interface are. `catcher/setup-load-balancer.ts` (still here, see the warning below)
+moves catcher's address off the VM and onto a passthrough Network Load Balancer
+forwarding rule pointed at the same VM. Nothing else changes: a passthrough NLB
+preserves the real client source IP at L3 (confirmed live via `ss -tn` on the backend
+VM), so the wake watcher's connection detection needs zero changes, and DNS keeps
+pointing at the exact same address.
 
-Steady-state cost with this applied: the free-tier catcher VM is $0, and the relay
-costs only its ~10GB boot disk (not a free-tier region, roughly $0.40/month) while
-stopped, plus a few cents of actual compute for however many hours players are
-connected. That's the whole bill.
+**This does not actually save money, and the setup below no longer uses it.**
+Dodging the ~$0.005/hour per-VM-IP charge this way trades it for a **forwarding rule
+minimum charge** that GCP bills per rule per hour regardless of traffic, and that
+minimum turned out to be *higher* than the ~$3.65/month it was avoiding, not lower:
+confirmed live 2026-08-17 against a real GCP bill, two Premium-tier NLB forwarding
+rules (catcher's TCP and UDP rules, one region) cost roughly $20/month combined in
+"Cloud Load Balancer Forwarding Rule Minimum" charges alone, before any actual
+traffic. Catcher now uses a plain 1:1 NAT static IP directly on the VM instead (the
+same setup relay already used), which is both simpler and cheaper. This section and
+`setup-load-balancer.ts` are kept for context and in case GCP's pricing changes again,
+not as the recommended path; step 6 below reflects the current recommendation.
+
+There's a second, unrelated reason this matters if you do use the load balancer path:
+a custom UDP relay script bound to catcher's specific external IP (`BIND_HOST`, see
+"Bedrock/mobile cross-play" below) only works *because* of NLB-specific local-route
+programming. Binding to a specific external IP on a plain 1:1 NAT VM silently fails,
+the guest OS never sees that address on any interface at all under a 1:1 NAT, only
+under an NLB. Match `BIND_HOST` to whichever one you're actually running (`0.0.0.0`
+for a plain 1:1 NAT, the LB's own IP if you're using `setup-load-balancer.ts`).
+
+Steady-state cost without the load balancer: the free-tier catcher VM's compute is
+$0, its static IP is the one real fixed cost (~$3.65/month, unavoidable for something
+that has to be reachable 24/7), and the relay costs only its ~10GB boot disk (not a
+free-tier region, roughly $0.40/month) while stopped, plus a few cents of actual
+compute for however many hours players are connected. That's the whole bill, and it's
+near $0 specifically while nobody's playing, the one genuinely idle-scaling cost left.
 
 **Other things worth checking if your bill isn't near zero**: an unattached leftover
-disk from an old experiment (`gcloud compute disks list`, look for empty `users`), and
-a reserved-but-unattached static IP left over from testing (`gcloud compute addresses
+disk from an old experiment (`gcloud compute disks list`, look for empty `users`); a
+reserved-but-unattached static IP left over from testing (`gcloud compute addresses
 list`, `STATUS: RESERVED` instead of `IN_USE` bills at a *higher* rate than one that's
-actually in use). Both are easy to create by accident while iterating on this setup and
-both are silent, ongoing charges until deleted.
+actually in use); and an orphaned load balancer from an abandoned experiment
+(`gcloud compute forwarding-rules list` across every region you've touched, not just
+the one you meant to use). All three are easy to create by accident while iterating on
+this setup and all are silent, ongoing charges until deleted. The load balancer case is
+the most expensive of the three by far: confirmed live 2026-08-17, an abandoned
+forwarding rule (plus its backend service, instance group, and health check) left
+behind from testing whether the relay could use the same load-balancer trick as
+catcher cost more per month than every other resource in the entire project combined,
+including the two VMs, both their disks, and catcher's own legitimate static IP.
+Deleting a forwarding rule alone isn't enough, it depends on a backend service, which
+depends on an instance group and a health check; all four have to go
+(`gcloud compute forwarding-rules delete`, then `backend-services delete`, then
+`instance-groups unmanaged delete` and `health-checks delete`, in that order, each one
+fails while something still depends on it).
 
 **Alternatives considered, for context**: AWS Lightsail's cheapest IPv4-capable plan is
 a flat $5/month, more than this setup costs even before the load balancer fix.
@@ -301,8 +340,9 @@ hostnames Java already uses, no new player-facing address needed.
 
 ## Layout
 
-- `catcher/` — the always-on entry point: `frps`, the wake watcher, the load balancer
-  setup that gets its IP cost to $0, and the custom UDP relay for Bedrock.
+- `catcher/`: the always-on entry point, `frps`, the wake watcher, the custom UDP
+  relay for Bedrock, and `setup-load-balancer.ts` (not used by default, see "Getting
+  the idle cost to (almost) $0").
 - `relay/` — the on-demand low-latency VM: `frps`, boot-time DNS update, the
   systemd-timer-based idle shutdown (not cron, needs sub-minute precision), and its
   own half of the Bedrock UDP relay.
@@ -377,9 +417,9 @@ three machines (catcher, relay, home server) before anything else.
      --network=default --direction=INGRESS --action=ALLOW \
      --rules=tcp:22 --source-ranges=0.0.0.0/0
 
-   # Reserve catcher's IP as its own resource before the VM exists, it later moves onto
-   # a load balancer forwarding rule (step 6), which only works for a static IP that
-   # outlives the VM it's currently attached to.
+   # Reserve catcher's IP as its own resource before the VM exists, so it survives the
+   # VM being recreated later (same reason relay's IP setup below is a plain address,
+   # not something auto-assigned per boot).
    gcloud compute addresses create mc-catcher-ip --region="${CATCHER_ZONE%-*}"
 
    gcloud compute instances create mc-catcher-vm \
@@ -419,14 +459,12 @@ three machines (catcher, relay, home server) before anything else.
 5. Install [XferHelper](https://github.com/mliem2k/XferHelper) on your home server
    (`git submodule update --init` here, then build and drop the jar in your plugins
    folder). Requires Paper/Spigot/Purpur 1.20.5+ for the Transfer packet.
-6. Once catcher and relay are both confirmed working with the VM's own IP, run
-   `bun run catcher/setup-load-balancer.ts` to get catcher's IP cost to $0. Validate
-   against a throwaway test IP first, exactly like the production cutover: create the
-   backend service and health check, point a second temporary reserved IP at it,
-   confirm identical behavior (same Minecraft status response, same latency, real
-   client IP preserved via `ss -tn` on the VM), only then repeat the cutover (detach the
-   real static IP from the VM, immediately create the real forwarding rule on it)
-   against your actual address, ideally when no players are online.
+6. That's it, catcher and relay each keep their own static IP directly on the VM
+   (the same 1:1 NAT setup for both), no load balancer needed. Do **not** run
+   `catcher/setup-load-balancer.ts`: it moves catcher's IP onto a load balancer
+   forwarding rule, which costs more per month than the per-VM-IP charge it's
+   trying to avoid (see "Getting the idle cost to (almost) $0" above). It's kept
+   in the repo only for reference in case GCP's pricing changes again.
 
 ## License
 

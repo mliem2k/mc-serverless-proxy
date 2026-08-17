@@ -68,9 +68,10 @@ resource "google_compute_firewall" "ssh" {
   depends_on = [google_project_service.compute]
 }
 
-# Catcher's IP is reserved as its own resource (not the VM's ephemeral default) since
-# it gets moved onto a load balancer forwarding rule later, see
-# catcher/setup-load-balancer.ts, that only works with a resource that outlives the VM.
+# Catcher's IP is reserved as its own resource (not the VM's ephemeral default) so it
+# survives the VM being recreated. It stays a plain 1:1 NAT address on the VM itself,
+# see the README's "Getting the idle cost to (almost) $0" for why this repo stopped
+# moving it onto a load balancer forwarding rule (catcher/setup-load-balancer.ts).
 resource "google_compute_address" "catcher" {
   name       = "mc-catcher-ip"
   region     = substr(var.catcher_zone, 0, length(var.catcher_zone) - 2)
@@ -86,10 +87,13 @@ resource "google_compute_instance" "catcher" {
   tags         = ["mc-catcher"]
 
   # Only settable at creation, gcloud compute instances update can't toggle this
-  # after the fact. Needed for the Bedrock UDP relay (catcher/udp_relay_catcher.ts):
-  # without it, GCP silently drops any reply whose source IP doesn't match the VM's
-  # own primary address, which is exactly what a reply through the load balancer's
-  # IP looks like once catcher/setup-load-balancer.ts moves the static IP there.
+  # after the fact. Was needed for the Bedrock UDP relay's anti-spoofing workaround
+  # when catcher sat behind a load balancer (catcher/udp_relay_catcher.ts's own
+  # comments have the detail), which this repo no longer sets up by default. Left
+  # enabled since it's harmless either way and relay recreation is disruptive to
+  # test removing it against; unverified whether it's still required on a plain
+  # 1:1 NAT VM, relay itself never set it and its UDP relay works fine, but that
+  # hasn't been directly confirmed for catcher's setup specifically.
   can_ip_forward = true
 
   boot_disk {
