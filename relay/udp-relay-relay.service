@@ -6,6 +6,17 @@ Requires=frps.service
 [Service]
 Type=simple
 Environment=RELAY_AUTH_TOKEN=REPLACE_ME
+# The relay's own static IP (see README, relay now sits behind a passthrough NLB
+# forwarding rule, same as catcher). Not 0.0.0.0: this codebase already proved on
+# catcher that a plain 0.0.0.0 bind still receives LB-forwarded packets fine, but
+# replies it sends go out via iptables SNAT after the fact instead of the kernel path
+# GCP's SDN expects for a load balancer's return traffic, and never reach the real
+# client (see catcher/udp_relay_catcher.ts's own comment for the full story). This
+# file was still defaulting to 0.0.0.0 despite relay having moved behind an LB;
+# fixed and confirmed live 2026-08-17 with a real RakNet unconnected-ping/pong round
+# trip against the specific IP (real 178-byte pong received). Set this to relay's
+# reserved address, e.g. mc-relay-ip's actual IP, not a placeholder.
+Environment=BIND_HOST=YOUR_RELAY_STATIC_IP
 ExecStart=/usr/local/bin/udp_relay_relay.ts
 Restart=always
 RestartSec=3

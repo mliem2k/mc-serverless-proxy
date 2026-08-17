@@ -15,9 +15,15 @@
 // channels can coexist without a frps proxy-name/port collision on the rare
 // occasion frpc.toml briefly registers against catcher instead.
 //
-// Unlike catcher, this VM has no load balancer in front of it, its own ephemeral
-// external IP is directly on the NIC (a plain 1:1 NAT), so binding to 0.0.0.0
-// works normally here, no anti-spoofing workaround needed.
+// Relay sits behind a passthrough NLB forwarding rule too now (see README, "give
+// the relay a permanent static IP"), the same as catcher, so BIND_HOST needs to be
+// relay's specific reserved address, not 0.0.0.0: a 0.0.0.0 bind still receives
+// LB-forwarded packets fine, but its replies go out via iptables SNAT after the
+// fact instead of the kernel path GCP's SDN expects for a load balancer's return
+// traffic, and never reach the real client (catcher/udp_relay_catcher.ts's own
+// comment has the full story; this file just hadn't been updated to match when
+// relay moved behind an LB, confirmed broken by direct analogy and fixed
+// 2026-08-17, verified with a real RakNet ping/pong round trip).
 //
 // No wake-detection logic here (relay doesn't wake itself, it's already running by
 // the time this does anything useful). Instead, real client activity touches
