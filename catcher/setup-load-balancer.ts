@@ -1,4 +1,11 @@
 #!/usr/bin/env bun
+// NOT RECOMMENDED, kept for reference only. Confirmed live 2026-08-17 against a real
+// GCP bill: the forwarding rule this script creates carries its own per-hour minimum
+// charge that costs MORE than the ~$3.65/month per-VM-IP charge it exists to avoid
+// (roughly $20/month for one region's TCP+UDP rules). See the README's "Getting the
+// idle cost to (almost) $0" for the full writeup. Only worth revisiting if GCP's
+// pricing changes again; the code below is otherwise still correct and working.
+//
 // Moves the catcher VM's reserved static IP off the VM's own network interface and onto
 // a passthrough Network Load Balancer forwarding rule instead.
 //

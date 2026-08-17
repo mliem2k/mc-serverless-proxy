@@ -6,7 +6,13 @@ Requires=frps.service
 [Service]
 Type=simple
 Environment=RELAY_AUTH_TOKEN=REPLACE_ME
-Environment=BIND_HOST=YOUR_CATCHER_STATIC_IP
+# 0.0.0.0, not catcher's static IP: catcher no longer sits behind a load
+# balancer (see README, "Getting the idle cost to (almost) $0"), so its
+# public IP is a plain 1:1 NAT the guest OS never actually sees on its own
+# NIC, same as relay's. Binding to the specific IP only ever worked because
+# of NLB-specific local-route programming; it silently fails to bind at all
+# without one.
+Environment=BIND_HOST=0.0.0.0
 Environment=GCP_PROJECT=YOUR_GCP_PROJECT_ID
 Environment=GCP_RELAY_ZONE=YOUR_RELAY_ZONE
 Environment=GCP_RELAY_INSTANCE=YOUR_RELAY_VM_NAME

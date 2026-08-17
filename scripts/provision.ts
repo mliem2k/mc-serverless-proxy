@@ -61,9 +61,10 @@ gcloud([
   "--rules=tcp:22", "--source-ranges=0.0.0.0/0",
 ]);
 
-// Reserve catcher's IP as its own resource before the VM exists, it later moves onto
-// a load balancer forwarding rule (catcher/setup-load-balancer.ts), which only works
-// for a static IP that outlives the VM it's currently attached to.
+// Reserve catcher's IP as its own resource before the VM exists, so it survives the
+// VM being recreated. Stays a plain 1:1 NAT address on the VM itself; see the
+// README's "Getting the idle cost to (almost) $0" for why this repo stopped moving
+// it onto a load balancer forwarding rule (catcher/setup-load-balancer.ts).
 gcloud(["compute", "addresses", "create", "mc-catcher-ip", `--region=${CATCHER_REGION}`]);
 
 gcloud([
@@ -71,10 +72,12 @@ gcloud([
   `--zone=${CATCHER_ZONE}`, "--machine-type=e2-micro",
   "--image-family=debian-12", "--image-project=debian-cloud",
   "--address=mc-catcher-ip", "--scopes=compute-rw", "--tags=mc-catcher",
-  // Only settable at creation. Needed for the Bedrock UDP relay
-  // (catcher/udp_relay_catcher.ts): without it, GCP silently drops any reply whose
-  // source IP doesn't match the VM's own primary address, exactly what a reply
-  // through the load balancer's IP looks like once setup-load-balancer.ts runs.
+  // Only settable at creation. Was needed for the Bedrock UDP relay's anti-spoofing
+  // workaround when catcher sat behind a load balancer (catcher/udp_relay_catcher.ts
+  // has the detail), which this repo no longer sets up by default. Left enabled
+  // since it's harmless either way; unverified whether it's still required on a
+  // plain 1:1 NAT VM (relay itself never set it and its UDP relay works fine, but
+  // that hasn't been directly confirmed for catcher's setup specifically).
   "--can-ip-forward",
 ]);
 
