@@ -300,22 +300,25 @@ exact address:port they sent their request to. Confirmed live: the reply genuine
 left catcher with the correct payload, just from the wrong source port, and it never
 reached a real client. `catcher/udp_relay_catcher.ts` +
 `home-server/udp_relay_home.ts` are a small purpose-built replacement: catcher binds
-directly to its own public IP (not `0.0.0.0`, see the file's own comments for why that
-specific detail matters on GCP) and always replies from that one socket, while a plain
-frp **TCP** proxy (frp's TCP proxying works fine, only its UDP proxy type is broken)
-carries a private, framed protocol between the two scripts so the actual UDP traffic
-never touches frp at all.
+to `0.0.0.0` (see the file's own comments; this used to need binding to a load
+balancer's own IP specifically, back when catcher sat behind one, see below) and
+always replies from that one socket, while a plain frp **TCP** proxy (frp's TCP
+proxying works fine, only its UDP proxy type is broken) carries a private, framed
+protocol between the two scripts so the actual UDP traffic never touches frp at all.
 
-**Getting UDP working end to end on GCP also needs `--can-ip-forward`** on the catcher
-VM, set at instance creation only, not something `gcloud compute instances update` can
-toggle after the fact. Without it, GCP's anti-spoofing filter silently drops any
-packet whose source doesn't match the VM's own primary IP, which is exactly what a
-reply through the load balancer's IP looks like. If you're setting this up fresh, put
-`--can-ip-forward` in your `terraform`/`scripts/provision.ts` run from the start;
-retrofitting it onto a live catcher means recreating the VM (keep the same boot disk,
-everything on it survives) and re-adding it to the load balancer's instance group
-(deleting an instance drops it from an unmanaged instance group silently, recreating
-with the same name does not re-add it automatically).
+**`--can-ip-forward` on GCP was a load-balancer-specific requirement, not a general
+one, and is no longer needed by the setup this README currently recommends.** It
+mattered only because GCP's anti-spoofing filter drops any packet whose source
+doesn't match the VM's own primary IP, and a reply sent through a load balancer's IP
+looks exactly like that. Catcher dropped the load balancer entirely on 2026-08-17 (the
+per-forwarding-rule minimum charge made it cost more than the plain-IP charge it was
+avoiding, see "Getting the idle cost to (almost) $0" above), and a plain 1:1 NAT setup
+has no such IP mismatch to trigger anti-spoofing on in the first place. Confirmed
+empirically on 2026-08-19 migrating catcher to Oracle Cloud (which has no equivalent
+setting at all): real Bedrock RakNet ping/pong worked with a stock instance, nothing
+analogous to `--can-ip-forward` configured. If you're running catcher behind a load
+balancer for some other reason, this still applies to you; the default path in this
+README no longer needs it.
 
 **TransferTool's mapping has to be by hostname, not IP.** It rewrites the Java
 Transfer packet's destination using a static config, matched against `host:port`. This

@@ -27,6 +27,8 @@
 // low-cost residual risk (one relay boot cycle, a few cents) given how much more
 // specific a fake has to be to pass both checks now, versus just holding a socket open.
 import { execFileSync } from "node:child_process";
+import { createSign } from "node:crypto";
+import { readFileSync } from "node:fs";
 
 const PROJECT = "YOUR_GCP_PROJECT_ID";
 const ZONE = "YOUR_RELAY_ZONE"; // e.g. asia-southeast1-b
@@ -61,14 +63,95 @@ function logger(message: string) {
   }
 }
 
+async function gcpTokenFromMetadata(): Promise<string | null> {
+  try {
+    // metadata.google.internal doesn't resolve off-GCP (e.g. on the Oracle Cloud host
+    // this is migrating to), which makes fetch() throw rather than return a bad status,
+    // so this needs its own try/catch to fall through to the service-account path below.
+    const res = await fetch(
+      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+      { headers: { "Metadata-Flavor": "Google" } },
+    );
+    if (!res.ok) return null;
+    const json = (await res.json()) as { access_token?: string };
+    return json.access_token ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function base64url(data: string | Buffer): string {
+  return (Buffer.isBuffer(data) ? data : Buffer.from(data)).toString("base64url");
+}
+
+interface ServiceAccountKey {
+  client_email: string;
+  private_key: string;
+  token_uri?: string;
+}
+
+// Re-signing a JWT and round-tripping to Google on every ~1s poll would be wasteful;
+// cached in memory and refreshed 60s before the token's own stated expiry.
+let cachedSaToken: { token: string; expiresAtMs: number } | null = null;
+
+async function gcpTokenFromServiceAccount(): Promise<string | null> {
+  if (cachedSaToken && cachedSaToken.expiresAtMs > Date.now()) return cachedSaToken.token;
+
+  const keyPath = process.env.GCP_SA_KEY_PATH;
+  if (!keyPath) {
+    logger("catcher_wake_watcher: GCP_SA_KEY_PATH not set, no fallback auth available");
+    return null;
+  }
+
+  let key: ServiceAccountKey;
+  try {
+    key = JSON.parse(readFileSync(keyPath, "utf8"));
+  } catch {
+    logger(`catcher_wake_watcher: failed to read/parse GCP_SA_KEY_PATH=${keyPath}`);
+    return null;
+  }
+
+  const tokenUri = key.token_uri ?? "https://oauth2.googleapis.com/token";
+  const nowSec = Math.floor(Date.now() / 1000);
+  const signingInput = `${base64url(JSON.stringify({ alg: "RS256", typ: "JWT" }))}.${base64url(
+    JSON.stringify({
+      iss: key.client_email,
+      scope: "https://www.googleapis.com/auth/cloud-platform",
+      aud: tokenUri,
+      exp: nowSec + 3600,
+      iat: nowSec,
+    }),
+  )}`;
+  const jwt = `${signingInput}.${base64url(createSign("RSA-SHA256").update(signingInput).sign(key.private_key))}`;
+
+  let res: Response;
+  try {
+    res = await fetch(tokenUri, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:jwt-bearer",
+        assertion: jwt,
+      }),
+    });
+  } catch {
+    logger("catcher_wake_watcher: service-account token exchange request failed");
+    return null;
+  }
+  if (!res.ok) {
+    logger(`catcher_wake_watcher: service-account token exchange failed, status=${res.status}`);
+    return null;
+  }
+  const json = (await res.json()) as { access_token?: string; expires_in?: number };
+  if (!json.access_token) return null;
+
+  cachedSaToken = { token: json.access_token, expiresAtMs: Date.now() + ((json.expires_in ?? 3600) - 60) * 1000 };
+  return cachedSaToken.token;
+}
+
 async function gcpToken(): Promise<string | null> {
-  const res = await fetch(
-    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-    { headers: { "Metadata-Flavor": "Google" } },
-  );
-  if (!res.ok) return null;
-  const json = (await res.json()) as { access_token?: string };
-  return json.access_token ?? null;
+  const metadataToken = await gcpTokenFromMetadata();
+  return metadataToken ?? gcpTokenFromServiceAccount();
 }
 
 async function relayStatus(token: string): Promise<string> {

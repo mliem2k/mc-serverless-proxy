@@ -1,0 +1,5 @@
+docs/superpowers/
+.superpowers/
+
+# Local run state from scripts/try_create_oracle_catcher.sh, not source
+scripts/oracle_catcher_instance.json
