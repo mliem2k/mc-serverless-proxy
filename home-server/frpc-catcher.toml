@@ -1,15 +1,14 @@
-# The PERMANENT tunnel: always dials catcher's own static IP directly, never
-# follows the relay the way home-server/frpc.toml (the dynamic one) does. Proxies
-# here need to be reachable from catcher regardless of whether the dynamic tunnel
-# currently points at catcher or the relay, this is what makes that possible.
+# The one permanent tunnel: dials catcher's own static IP directly.
 serverAddr = "YOUR_CATCHER_STATIC_IP"
 serverPort = 7000
 auth.method = "token"
 auth.token = "REPLACE_ME"
 
-# The always-on path: catcher's own frps forwards straight to this, independent of
-# the dynamic tunnel's target, so players can always reach the server via catcher
-# even while the dynamic tunnel is pointed at the relay for someone else's session.
+# Without transport.proxyProtocolVersion, the local Minecraft server would see every
+# connection as coming from frpc's own loopback address instead of the real player's
+# IP (frp's tunnel forwards the connection, but by default not the original source
+# address). PROXY protocol v2 carries the real client IP through the tunnel so any
+# IP-based logging, rate limiting, or banning on the game server itself still works.
 [[proxies]]
 name = "minecraft-catcher"
 type = "tcp"
@@ -24,12 +23,7 @@ transport.proxyProtocolVersion = "v2"
 # arrived on, which breaks NAT traversal for real clients (confirmed live
 # 2026-07-18). frp's TCP proxying is unaffected by that bug, so this plain TCP proxy
 # just carries a private, token-authenticated tunnel for the custom relay's own
-# framed protocol. Lives on THIS permanent tunnel, not the dynamic one: catcher is
-# always the entry point for players who haven't been transferred yet, so its UDP
-# relay control channel needs to always be reachable too, regardless of where the
-# dynamic tunnel currently points (confirmed live 2026-07-18: putting this on the
-# dynamic tunnel instead broke catcher's Bedrock relay every time it moved to the
-# relay for an unrelated Java wake).
+# framed protocol.
 [[proxies]]
 name = "udp-relay-control"
 type = "tcp"

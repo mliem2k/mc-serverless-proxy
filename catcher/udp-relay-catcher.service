@@ -13,9 +13,6 @@ Environment=RELAY_AUTH_TOKEN=REPLACE_ME
 # of NLB-specific local-route programming; it silently fails to bind at all
 # without one.
 Environment=BIND_HOST=0.0.0.0
-Environment=GCP_PROJECT=YOUR_GCP_PROJECT_ID
-Environment=GCP_RELAY_ZONE=YOUR_RELAY_ZONE
-Environment=GCP_RELAY_INSTANCE=YOUR_RELAY_VM_NAME
 ExecStart=/usr/local/bin/udp_relay_catcher.ts
 Restart=always
 RestartSec=5

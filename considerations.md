@@ -1,5 +1,21 @@
 # Hosting considerations
 
+## 2026-08-19: relay fully decommissioned
+
+Relay is no longer a cold spare, it's gone. `mc-relay-vm` and its disk are deleted
+(not just stopped), and its GCP service accounts and the custom `catcherRelayWaker`
+IAM role are deleted too. Catcher's move to Oracle Cloud's Always Free tier in
+`ap-singapore-1` (see "Current state" below) already puts catcher itself in the
+low-latency region relay used to wake into on demand, so relay's entire reason for
+existing, shortening the distance between catcher's original `us-west1` location
+and SEA/Indonesia players, no longer applies. All relay-related code (the
+`relay/` directory, `catcher_wake_watcher.ts`, the Transfer-packet handoff,
+the XferHelper-driven join watcher) has been removed from this repo, not just
+the VM. The "bring relay back" instructions further down this file describe a
+GCP load-balancer-fronted relay that no longer has anything to talk to, since
+the wake mechanism that would have triggered it is gone; treat them as historical
+only, not a runnable recovery path, unless the wake/transfer code is rebuilt first.
+
 Notes from a 2026-08-17 cost investigation, kept so the same alternatives don't get
 re-researched from scratch next time the bill looks high. Two separate things happened
 that day, worth keeping distinct:
@@ -102,21 +118,30 @@ checking back on that specifically. The only remaining known charge is relay's i
    (first the apt lists lock, then a separate dpkg frontend lock a bit later), wait
    it out rather than fighting it, it clears on its own.
 
-**Cross-cloud wake-watcher auth**, needed because relay stays on GCP while catcher no
-longer does: `catcher_wake_watcher.ts`'s `gcpToken()` used to only call GCP's internal
-metadata server, which doesn't exist off-GCP. It now tries that first (unchanged, fast
-path if catcher is ever on GCP again) and falls back to a real GCP service-account
-JSON key (RS256-signed JWT, `node:crypto`, no new dependency), read from
-`GCP_SA_KEY_PATH` (`/etc/frp/gcp-sa-key.json` on the Oracle box, `chmod 600`, never
-committed). The service account (`catcher-wake-relay@mc-relay-mliem.iam.gserviceaccount.com`)
-holds a custom role, `catcherRelayWaker`, scoped to exactly `compute.instances.get`,
-`.list`, `.start`, nothing else, no delete/stop/create on anything. Verified live: the
-full chain (sign JWT, exchange for an access token, call the real Compute API,
-correctly read `mc-relay-vm`'s actual status) works from the Oracle box.
+**Cross-cloud wake-watcher auth, superseded later the same day (2026-08-19): this
+entire mechanism was deleted when relay was fully decommissioned, see the top of this
+file.** Kept below as historical record of what was built and verified at the time,
+not a description of anything currently live. Needed because relay stayed on GCP
+while catcher no longer did: `catcher_wake_watcher.ts`'s `gcpToken()` used to only call
+GCP's internal metadata server, which doesn't exist off-GCP. It tried that first
+(unchanged, fast path if catcher was ever on GCP again) and fell back to a real GCP
+service-account JSON key (RS256-signed JWT, `node:crypto`, no new dependency), read
+from `GCP_SA_KEY_PATH` (`/etc/frp/gcp-sa-key.json` on the Oracle box, `chmod 600`,
+never committed). The service account
+(`catcher-wake-relay@mc-relay-mliem.iam.gserviceaccount.com`) held a custom role,
+`catcherRelayWaker`, scoped to exactly `compute.instances.get`, `.list`, `.start`,
+nothing else, no delete/stop/create on anything. Verified live at the time: the full
+chain (sign JWT, exchange for an access token, call the real Compute API, correctly
+read `mc-relay-vm`'s actual status) worked from the Oracle box. Both the service
+account and the custom role are now deleted; `catcher_wake_watcher.ts` is deleted;
+`catcher/udp_relay_catcher.ts` had its own independent copy of this same mechanism for
+the Bedrock/UDP path (found during the relay decommission, since Bedrock traffic never
+touched the TCP-only watcher above) and that's been stripped out too.
 
 **Reproducing this migration, or reverting it:** `scripts/provision_oracle_catcher.sh`
 does the actual systemd/frps/token setup (idempotent, checks for the frps binary and
-the two `.ts` scripts already being in place rather than fetching them itself) and
+the one `.ts` script already being in place rather than fetching it itself, the
+wake-watcher script it used to also check for no longer exists) and
 `scripts/try_create_oracle_catcher.sh` is the capacity-retry launcher, kept for the
 next time Always Free capacity needs waiting out (works via the `oci` CLI once
 `~/.oci/config` and an API key are set up on whatever machine runs it, see the Oracle

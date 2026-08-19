@@ -14,13 +14,6 @@
 // through the SAME bound UDP socket that received their request, so the source port a
 // client sees is always the real public port, matching normal NAT expectations.
 //
-// Also does its own relay-wake detection, mirroring catcher_wake_watcher.ts's
-// persistence + byte-volume heuristic for the Java TCP port: a client active for
-// CONFIRM_SECONDS and past MIN_ACTIVITY_BYTES is treated as a real connection attempt,
-// not a status ping (confirmed live: a ping totals ~172 bytes, a real RakNet
-// handshake's first packet alone is 1464 bytes). Without this, catcher_wake_watcher.ts
-// (which only ever sees TCP flows) would never notice a Bedrock-only player at all.
-//
 // Wire protocol over the TCP tunnel, both directions identical:
 //   4 bytes  total length of everything after this field (big-endian uint32)
 //   1 byte   client IP string length (N)
@@ -57,12 +50,6 @@ const CONTROL_HOST = process.env.CONTROL_HOST || "127.0.0.1"; // loops back thro
 const CONTROL_PORT = Number(process.env.CONTROL_PORT || 19133);
 const AUTH_TOKEN = process.env.RELAY_AUTH_TOKEN || "REPLACE_ME";
 
-const GCP_PROJECT = process.env.GCP_PROJECT || "YOUR_GCP_PROJECT_ID";
-const GCP_ZONE = process.env.GCP_RELAY_ZONE || "YOUR_RELAY_ZONE";
-const GCP_INSTANCE = process.env.GCP_RELAY_INSTANCE || "YOUR_RELAY_VM_NAME";
-const CONFIRM_SECONDS = Number(process.env.WAKE_CONFIRM_SECONDS || 9);
-const MIN_ACTIVITY_BYTES = Number(process.env.WAKE_MIN_ACTIVITY_BYTES || 2048);
-
 function encodeFrame(clientIp: string, clientPort: number, payload: Buffer): Buffer {
   const ipBytes = Buffer.from(clientIp, "utf8");
   const body = Buffer.concat([
@@ -80,98 +67,11 @@ function encodeFrame(clientIp: string, clientPort: number, payload: Buffer): Buf
   return Buffer.concat([lenPrefix, body]);
 }
 
-async function gcpToken(): Promise<string | null> {
-  try {
-    const res = await fetch(
-      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-      { headers: { "Metadata-Flavor": "Google" } },
-    );
-    const json = (await res.json()) as { access_token?: string };
-    return json.access_token ?? null;
-  } catch {
-    return null;
-  }
-}
-
-async function relayStatus(token: string): Promise<string> {
-  try {
-    const res = await fetch(
-      `https://compute.googleapis.com/compute/v1/projects/${GCP_PROJECT}/zones/${GCP_ZONE}/instances/${GCP_INSTANCE}`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
-    const json = (await res.json()) as { status?: string };
-    return json.status ?? "UNKNOWN";
-  } catch {
-    return "UNKNOWN";
-  }
-}
-
-async function triggerWake() {
-  const token = await gcpToken();
-  if (!token) {
-    console.warn("failed to fetch metadata token, skipping wake");
-    return;
-  }
-  const status = await relayStatus(token);
-  console.log(`relay status=${status}`);
-  if (status === "RUNNING" || status === "STAGING" || status === "PROVISIONING") {
-    console.log(`relay already ${status}, skipping wake`);
-    return;
-  }
-  console.log(`triggering wake (relay was ${status})`);
-  const res = await fetch(
-    `https://compute.googleapis.com/compute/v1/projects/${GCP_PROJECT}/zones/${GCP_ZONE}/instances/${GCP_INSTANCE}/start`,
-    { method: "POST", headers: { Authorization: `Bearer ${token}` } },
-  );
-  console.log(`wake response: ${await res.text()}`);
-}
-
-interface ActivityEntry {
-  firstSeen: number;
-  lastSeen: number;
-  bytes: number;
-  triggered: boolean;
-}
-
-const activity = new Map<string, ActivityEntry>();
-
-function trackActivity(clientIp: string, clientPort: number, nbytes: number) {
-  const key = `${clientIp}:${clientPort}`;
-  const now = Date.now();
-  let entry = activity.get(key);
-  if (!entry) {
-    entry = { firstSeen: now, lastSeen: now, bytes: nbytes, triggered: false };
-    activity.set(key, entry);
-    return;
-  }
-  entry.bytes += nbytes;
-  entry.lastSeen = now;
-  if (entry.triggered) return;
-  const elapsedSeconds = (now - entry.firstSeen) / 1000;
-  if (elapsedSeconds >= CONFIRM_SECONDS && entry.bytes >= MIN_ACTIVITY_BYTES) {
-    entry.triggered = true;
-    console.log(
-      `${clientIp}:${clientPort} active for ${elapsedSeconds.toFixed(1)}s, ${entry.bytes} bytes exchanged, treating as a real connection, checking relay`,
-    );
-    void triggerWake();
-  }
-}
-
-// Bare pings never cross the wake threshold and would otherwise accumulate in
-// `activity` forever, since nothing else ever removes them.
-setInterval(() => {
-  const now = Date.now();
-  for (const [key, entry] of activity) {
-    if (now - entry.lastSeen > 60_000) activity.delete(key);
-  }
-}, 30_000);
-
 const socket = dgram.createSocket("udp4");
 let tunnelSocket: net.Socket | null = null;
 
 socket.on("message", (data, rinfo) => {
   console.log(`client -> home: ${rinfo.address}:${rinfo.port} (${data.length} bytes)`);
-  trackActivity(rinfo.address, rinfo.port, data.length);
   if (!tunnelSocket) {
     console.warn(`no active tunnel to home, dropping packet from ${rinfo.address}:${rinfo.port}`);
     return;
@@ -218,7 +118,6 @@ function connectTunnel() {
       const payload = body.subarray(3 + ipLen);
 
       console.log(`home -> client: ${clientIp}:${clientPort} (${payload.length} bytes)`);
-      trackActivity(clientIp, clientPort, payload.length);
       socket.send(payload, clientPort, clientIp);
     }
   });

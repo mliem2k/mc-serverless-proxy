@@ -1,6 +1,6 @@
 variable "project_id" {
   type        = string
-  description = "GCP project ID both VMs are created in."
+  description = "GCP project ID the catcher VM is created in."
 }
 
 variable "catcher_zone" {
@@ -9,14 +9,8 @@ variable "catcher_zone" {
   default     = "us-west1-a"
 }
 
-variable "relay_zone" {
-  type        = string
-  description = "Zone for the on-demand relay VM. Pick whatever region you actually want low latency for, it does not need to be a free-tier region since the relay only runs a few hours a week."
-  default     = "asia-southeast1-b"
-}
-
 variable "ssh_source_ranges" {
   type        = list(string)
-  description = "CIDR ranges allowed to reach :22 on either VM. Defaults to open; narrow this to your own IP if you want tighter SSH exposure."
+  description = "CIDR ranges allowed to reach :22 on the VM. Defaults to open; narrow this to your own IP if you want tighter SSH exposure."
   default     = ["0.0.0.0/0"]
 }

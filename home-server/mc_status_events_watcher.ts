@@ -1,16 +1,13 @@
 #!/usr/bin/env bun
 // Tails the actual Minecraft server log for real "joined the game" / "left the game"
-// events and pushes each one, in real time, to the mc-status webhook endpoint. This is
-// a separate, independent process from join_transfer_watcher.ts (which shares the same
-// log-tailing pattern but exists to decide when to fire a relay transfer): a bug here
-// must never risk that transfer logic, and vice versa.
+// events and pushes each one, in real time, to the mc-status webhook endpoint.
 //
 // Exists because polling a status endpoint (the previous approach) can only see a
 // player if a poll happens to land while they're online, missing anything shorter than
 // the poll gap. Confirmed live 2026-07-19: a failed-login connection attempt (~6-10s
-// long) woke the relay but never appeared in the player event log, since no poll landed
-// during either window. Tailing the log has no such gap, Bukkit logs the join/leave the
-// instant it happens, and includes connections that never complete AuthMe login.
+// long) never appeared in the player event log, since no poll landed during either
+// window. Tailing the log has no such gap, Bukkit logs the join/leave the instant it
+// happens, and includes connections that never complete AuthMe login.
 //
 // See docs/superpowers/specs/2026-07-20-mc-status-realtime-player-events-design.md in
 // mliem-landing for the full design.

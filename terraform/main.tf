@@ -90,10 +90,8 @@ resource "google_compute_instance" "catcher" {
   # after the fact. Was needed for the Bedrock UDP relay's anti-spoofing workaround
   # when catcher sat behind a load balancer (catcher/udp_relay_catcher.ts's own
   # comments have the detail), which this repo no longer sets up by default. Left
-  # enabled since it's harmless either way and relay recreation is disruptive to
-  # test removing it against; unverified whether it's still required on a plain
-  # 1:1 NAT VM, relay itself never set it and its UDP relay works fine, but that
-  # hasn't been directly confirmed for catcher's setup specifically.
+  # enabled since it's harmless either way; unverified whether it's still required
+  # on a plain 1:1 NAT VM (not directly confirmed for catcher's current setup).
   can_ip_forward = true
 
   boot_disk {
@@ -110,57 +108,5 @@ resource "google_compute_instance" "catcher" {
     }
   }
 
-  # compute-rw scope + the IAM binding below is what lets catcher_wake_watcher.ts call
-  # the Compute API to start the relay VM, authenticated via this VM's own
-  # metadata-server token, no key file involved.
-  service_account {
-    scopes = ["compute-rw"]
-  }
-
   depends_on = [google_project_service.compute]
-}
-
-resource "google_compute_instance" "relay" {
-  name         = "mc-relay-vm"
-  zone         = var.relay_zone
-  machine_type = "e2-micro"
-  tags         = ["mc-relay"]
-
-  # Stopped by default, this is the on-demand VM, catcher wakes it. Ephemeral IP is
-  # intentional (see relay/relay_boot_ddns.ts): it changes on every boot and DNS gets
-  # pointed at whatever it currently is.
-  desired_status = "TERMINATED"
-
-  boot_disk {
-    initialize_params {
-      image = "debian-cloud/debian-12"
-      size  = 10
-    }
-  }
-
-  network_interface {
-    network = "default"
-    access_config {}
-  }
-
-  service_account {
-    scopes = ["cloud-platform"]
-  }
-
-  depends_on = [google_project_service.compute]
-}
-
-# Lets catcher's service account start/stop the relay VM specifically, and nothing
-# else in the project, rather than granting roles/compute.instanceAdmin.v1 at the
-# project level. IAM conditions are how you scope a role to one resource in GCP,
-# there's no narrower built-in role than instanceAdmin for start/stop.
-resource "google_project_iam_member" "catcher_can_wake_relay" {
-  project = var.project_id
-  role    = "roles/compute.instanceAdmin.v1"
-  member  = "serviceAccount:${google_compute_instance.catcher.service_account[0].email}"
-
-  condition {
-    title      = "catcher-can-only-touch-relay"
-    expression = "resource.name.endsWith(\"/instances/mc-relay-vm\")"
-  }
 }

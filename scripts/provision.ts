@@ -1,13 +1,10 @@
 #!/usr/bin/env bun
 // Bun equivalent of the raw gcloud commands in the README's setup step 1, for anyone
 // who wants a runnable script without pulling in Terraform. Does exactly what
-// terraform/main.tf does: firewall rules, catcher's reserved static IP, both VMs
-// (relay created then immediately stopped, it's the on-demand one), and an
-// IAM-condition-scoped binding so catcher's service account can only start/stop the
-// relay instance specifically, not the whole project.
+// terraform/main.tf does: firewall rules, catcher's reserved static IP, and the VM.
 //
 // Usage: PROJECT=your-project-id bun run scripts/provision.ts
-// Optional env vars: CATCHER_ZONE (default us-west1-a), RELAY_ZONE (default asia-southeast1-b)
+// Optional env vars: CATCHER_ZONE (default us-west1-a)
 import { spawnSync } from "node:child_process";
 
 const PROJECT = process.env.PROJECT;
@@ -16,7 +13,6 @@ if (!PROJECT) {
   process.exit(1);
 }
 const CATCHER_ZONE = process.env.CATCHER_ZONE || "us-west1-a"; // Always Free eligible: us-west1/us-central1/us-east1
-const RELAY_ZONE = process.env.RELAY_ZONE || "asia-southeast1-b"; // whichever region you want low latency for
 const CATCHER_REGION = CATCHER_ZONE.slice(0, CATCHER_ZONE.lastIndexOf("-"));
 
 function gcloud(args: string[]) {
@@ -25,14 +21,6 @@ function gcloud(args: string[]) {
   if (result.status !== 0) {
     throw new Error(`gcloud ${args[0]} ${args[1]} failed with exit code ${result.status}`);
   }
-}
-
-function gcloudCapture(args: string[]): string {
-  const result = spawnSync("gcloud", args, { encoding: "utf8" });
-  if (result.status !== 0) {
-    throw new Error(`gcloud ${args[0]} ${args[1]} failed with exit code ${result.status}: ${result.stderr}`);
-  }
-  return result.stdout.trim();
 }
 
 gcloud(["config", "set", "project", PROJECT]);
@@ -71,38 +59,13 @@ gcloud([
   "compute", "instances", "create", "mc-catcher-vm",
   `--zone=${CATCHER_ZONE}`, "--machine-type=e2-micro",
   "--image-family=debian-12", "--image-project=debian-cloud",
-  "--address=mc-catcher-ip", "--scopes=compute-rw", "--tags=mc-catcher",
+  "--address=mc-catcher-ip", "--tags=mc-catcher",
   // Only settable at creation. Was needed for the Bedrock UDP relay's anti-spoofing
   // workaround when catcher sat behind a load balancer (catcher/udp_relay_catcher.ts
   // has the detail), which this repo no longer sets up by default. Left enabled
   // since it's harmless either way; unverified whether it's still required on a
-  // plain 1:1 NAT VM (relay itself never set it and its UDP relay works fine, but
-  // that hasn't been directly confirmed for catcher's setup specifically).
+  // plain 1:1 NAT VM.
   "--can-ip-forward",
 ]);
 
-gcloud([
-  "compute", "instances", "create", "mc-relay-vm",
-  `--zone=${RELAY_ZONE}`, "--machine-type=e2-micro",
-  "--image-family=debian-12", "--image-project=debian-cloud",
-  "--scopes=cloud-platform", "--tags=mc-relay",
-]);
-gcloud(["compute", "instances", "stop", "mc-relay-vm", `--zone=${RELAY_ZONE}`]);
-
-// Scope catcher's ability to start/stop VMs down to just the relay instance.
-// --scopes on the VM controls what the metadata-server token is CAPABLE of
-// requesting; this IAM binding controls what it's actually ALLOWED to do. Both are
-// needed, the scope alone grants nothing without the IAM role.
-const catcherSa = gcloudCapture([
-  "compute", "instances", "describe", "mc-catcher-vm", `--zone=${CATCHER_ZONE}`,
-  "--format=value(serviceAccounts[0].email)",
-]);
-
-gcloud([
-  "projects", "add-iam-policy-binding", PROJECT,
-  `--member=serviceAccount:${catcherSa}`,
-  "--role=roles/compute.instanceAdmin.v1",
-  '--condition=expression=resource.name.endsWith("/instances/mc-relay-vm"),title=catcher-can-only-touch-relay',
-]);
-
-console.log("\nDone. Catcher and relay VMs provisioned, relay stopped (on-demand).");
+console.log("\nDone. Catcher VM provisioned.");
