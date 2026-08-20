@@ -1,5 +1,46 @@
 # Hosting considerations
 
+## 2026-08-20: Bedrock UDP head-of-line-blocking tradeoff fixed (WireGuard replaces udp_relay_*)
+
+The old Bedrock path wrapped UDP inside frp's TCP tunnel (`catcher/udp_relay_catcher.ts`
++ `home-server/udp_relay_home.ts`, a small userspace UDP-over-TCP bridge, both now
+deleted along with their systemd units). That worked but carried a structural cost:
+RakNet/Bedrock is loss-tolerant and doesn't want retransmission, but TCP forces
+in-order delivery, so one dropped packet anywhere on the path stalled every packet
+behind it (head-of-line blocking) until TCP retransmitted it. Flagged during the
+2026-08-19 performance audit, fixed the next day once asked to.
+
+Replaced with a real WireGuard tunnel between catcher and home (`10.99.0.1` catcher,
+`10.99.0.2` home) plus a kernel DNAT rule on catcher forwarding public UDP 19132
+straight to `10.99.0.2:19132`. This is genuine UDP end to end, no TCP anywhere in the
+Bedrock path, so a dropped packet is just dropped, no HOL stall. Verified live with a
+real RakNet unconnected-ping/pong before AND after removing the old services (only
+cut over once the new path proved MOTD came back through DNAT correctly), then
+re-verified Java + Bedrock end to end through `mc.mliem.com` after cutover.
+
+Setup was manual (two boxes, one tunnel, not worth a script): `wg genkey`/`wg pubkey`
+on each side, `/etc/wireguard/wg0.conf` on each with the peer's public key and
+`AllowedIPs`, `wg-quick@wg0` enabled via systemd for boot persistence. Three gotchas:
+
+1. **MTU**: catcher's `wg0` came up at MTU 8920, inherited from Oracle's internal
+   jumbo-frame VCN interface (`ens3` at MTU 9000). Fine on Oracle's own internal
+   network, wrong for a tunnel actually crossing the public internet, causes silent
+   fragmentation/drops. Fixed with `ip link set mtu 1420 dev wg0` and `MTU = 1420` in
+   `wg0.conf`'s `[Interface]` so it survives a restart. Home's came up correctly at
+   1420 on its own, only catcher needed this.
+2. **iptables FORWARD chain**: Oracle's default FORWARD chain has policy ACCEPT but a
+   catch-all REJECT rule sitting at position 1 anyway, so nothing forwarded through
+   `wg0` regardless of the ACCEPT policy. Needed explicit ACCEPT rules for `wg0`
+   in/out and established connections inserted ahead of that REJECT.
+3. Same "Oracle's own local iptables gates ports on top of the VCN security list"
+   gotcha as before (see gotcha #2 further down this file), applied again for UDP
+   51820 (WireGuard's port) on both the security list and catcher's local iptables.
+
+`home-server/udp-relay-home.service` also had a latent bug found during this work,
+unrelated to the tunnel swap itself: it depended on `frpc.service` (relay's old
+tunnel, long gone) instead of `frpc-catcher.service` (catcher's, what it actually
+needs). Fixed on the live box and in the repo template before the WireGuard cutover.
+
 ## 2026-08-19: relay fully decommissioned
 
 Relay is no longer a cold spare, it's gone. `mc-relay-vm` and its disk are deleted
@@ -82,12 +123,18 @@ Still US-only-equivalent (Singapore instead), no relay, same tradeoff as before,
 everyone connects, SEA/Indonesia players just don't get the low-latency handoff until
 relay comes back (unrelated to this migration, see below).
 
-The old GCP catcher (`mc-catcher-vm`, `us-west1-a`) is **stopped, its static IP
-released**, kept as a cold spare exactly like relay always was (disk kept, nothing
-deleted, `git -C` config for it still applies if this whole migration needs reverting,
-just re-run the old reactivation steps from the version of this file before
-2026-08-19). `mc-relay-vm` is unchanged, still stopped, load balancer chain still
-deleted, per the 2026-08-17/18 notes above.
+**Update, 2026-08-19 (later the same day): the GCP catcher cold spare is gone too.**
+`mc-catcher-vm` and its disk are deleted (not just stopped), along with the
+Minecraft-specific firewall rules (`allow-catcher-minecraft`, `allow-frp-control`,
+`allow-minecraft`, `allow-minecraft-bedrock`), decided once relay's removal made it
+clear catcher+relay on GCP has no future here, catcher lives on Oracle permanently
+now. GCP's own generic default firewall rules (SSH, ICMP, internal, RDP) were left
+alone, not part of this project's specific infra. The `mc-relay-mliem` GCP project
+itself is untouched (not deleted), but as of this note it holds no catcher/relay
+compute, disks, or custom firewall rules at all, only the account's own default
+service account and default network. If any of this ever needs rebuilding from
+scratch, the old reactivation/provisioning steps in this file's earlier revisions are
+a starting reference, not a live recovery path.
 
 **Steady-state cost now: genuinely close to $0/month.** Oracle's Always Free covers
 the E2.1.Micro compute, its boot disk, and (unlike GCP/AWS) does not appear to charge

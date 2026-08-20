@@ -100,13 +100,17 @@ dynamically allocated port instead of the port the request arrived on, which bre
 NAT traversal for real clients, most home/mobile routers only accept a reply from
 the exact address:port they sent their request to. Confirmed live: the reply
 genuinely left catcher with the correct payload, just from the wrong source port,
-and it never reached a real client. `catcher/udp_relay_catcher.ts` +
-`home-server/udp_relay_home.ts` are a small purpose-built replacement: catcher
-binds to `0.0.0.0` (see the file's own comments; this used to need binding to a
-load balancer's own IP specifically, back when catcher sat behind one, see above)
-and always replies from that one socket, while a plain frp **TCP** proxy (frp's TCP
-proxying works fine, only its UDP proxy type is broken) carries a private, framed
-protocol between the two scripts so the actual UDP traffic never touches frp at all.
+and it never reached a real client.
+
+An earlier fix (`catcher/udp_relay_catcher.ts` + `home-server/udp_relay_home.ts`,
+both deleted 2026-08-20) wrapped raw UDP frames inside a private protocol carried
+over a plain frp **TCP** proxy. That worked, but TCP forces in-order delivery, which
+head-of-line-blocks RakNet/Bedrock traffic on any dropped packet, exactly the
+retransmission cost UDP is supposed to avoid for a loss-tolerant protocol. Replaced
+with a real WireGuard tunnel between catcher and home plus a kernel DNAT rule
+forwarding public UDP 19132 straight through to home over the tunnel, genuine UDP
+end to end, no TCP anywhere in the path. See `considerations.md`'s "Bedrock UDP
+head-of-line-blocking tradeoff fixed" section for the setup and gotchas.
 
 **`--can-ip-forward` on GCP was a load-balancer-specific requirement, not a general
 one, and is no longer needed by the setup this README currently recommends.** It
@@ -136,11 +140,11 @@ a load balancer, which is not the default path anymore.
 
 ## Layout
 
-- `catcher/`: the always-on entry point, `frps`, the custom UDP relay for Bedrock,
-  and `setup-load-balancer.ts` (not used by default, see "Getting the idle cost to
-  (almost) $0").
-- `home-server/`: runs on your actual Minecraft box, `frpc` dialing catcher, and
-  the custom UDP relay's home-side half for Bedrock traffic.
+- `catcher/`: the always-on entry point, `frps`, and `setup-load-balancer.ts` (not
+  used by default, see "Getting the idle cost to (almost) $0"). Bedrock/UDP goes
+  through a WireGuard tunnel + DNAT set up directly on the box, not any file here,
+  see `considerations.md`.
+- `home-server/`: runs on your actual Minecraft box, `frpc` dialing catcher.
 - `terraform/` and `scripts/provision.ts`: two equivalent ways to provision the
   catcher VM and its reserved static IP, pick one, they create the same resources.
 - `scripts/provision_oracle_catcher.sh` and `scripts/try_create_oracle_catcher.sh`:
