@@ -3,3 +3,9 @@ docs/superpowers/
 
 # Local run state from scripts/try_create_oracle_catcher.sh, not source
 scripts/oracle_catcher_instance.json
+
+# Real secrets, plaintext, before encryption with scripts/secrets.sh. Only
+# the committed *.example template and the encrypted secrets/*.age file
+# belong in git, see secrets/README.md.
+secrets/*.plaintext
+*.env

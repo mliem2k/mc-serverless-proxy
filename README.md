@@ -142,14 +142,22 @@ a load balancer, which is not the default path anymore.
 
 - `catcher/`: the always-on entry point, `frps`, and `setup-load-balancer.ts` (not
   used by default, see "Getting the idle cost to (almost) $0"). Bedrock/UDP goes
-  through a WireGuard tunnel + DNAT set up directly on the box, not any file here,
-  see `considerations.md`.
+  through a WireGuard tunnel + DNAT, provisioned by `scripts/provision_wireguard.sh`
+  below, not any file here.
 - `home-server/`: runs on your actual Minecraft box, `frpc` dialing catcher.
 - `terraform/` and `scripts/provision.ts`: two equivalent ways to provision the
   catcher VM and its reserved static IP, pick one, they create the same resources.
 - `scripts/provision_oracle_catcher.sh` and `scripts/try_create_oracle_catcher.sh`:
   the Oracle Cloud Always Free setup catcher currently runs on, see
   `considerations.md` for the full story.
+- `scripts/provision_wireguard.sh`: idempotent, sets up the WireGuard tunnel plus
+  (on catcher) the DNAT and forwarding rules Bedrock needs. Run once per box with
+  `--role catcher` or `--role home`, config comes from required environment
+  variables, see the script's own header comment for the exact invocation.
+- `scripts/secrets.sh` and `secrets/`: the real WireGuard keys and the frp auth
+  token, encrypted at rest with `age` and committed as `secrets/wireguard.env.age`.
+  See `secrets/README.md` for how to decrypt them before running
+  `provision_wireguard.sh`, or how to add a new secret.
 
 ## Setup
 

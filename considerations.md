@@ -1,5 +1,32 @@
 # Hosting considerations
 
+## 2026-08-21: WireGuard setup codified, secrets encrypted at rest with age
+
+The manual WireGuard setup from 2026-08-20 (below) only existed as shell history
+and prose in this file, so a box loss meant rebuilding it from memory. Two things
+fixed that:
+
+1. `scripts/provision_wireguard.sh`, an idempotent script matching the style of
+   `scripts/provision_oracle_catcher.sh` (numbered steps, required env vars with
+   clear errors, root check, closing status check). Run with `--role catcher` or
+   `--role home`. Never regenerates an existing private key on re-run, that would
+   break the tunnel by invalidating the peer relationship, it only generates one
+   the first time a box has none yet. Applies the exact DNAT, MASQUERADE, FORWARD,
+   and INPUT rules from the manual setup below, idempotently (checks with
+   `iptables -C` before inserting, and inserts new ACCEPT rules before the chain's
+   existing REJECT catch-all rather than appending after it, an append-after-REJECT
+   rule would never fire). Also handles the ip_forward sysctl edit and
+   iptables-persistent install/save on catcher.
+2. The real WireGuard private keys and the frp auth token are encrypted at rest
+   with `age` into `secrets/wireguard.env.age`, committed to this repo. Decrypt
+   with `scripts/secrets.sh decrypt secrets/wireguard.env.age`, source the result,
+   then run `provision_wireguard.sh`. See `secrets/README.md` for the full
+   walkthrough (generating an age identity, encrypting, decrypting) and the
+   never-commit list (the age identity file, any plaintext copy of the secrets).
+   Chose `age` over `sops` since this is a two box personal project, a single
+   encrypted file plus one local identity file is the whole requirement, sops's
+   structured per key YAML encryption solves a problem this repo doesn't have.
+
 ## 2026-08-20: Bedrock UDP head-of-line-blocking tradeoff fixed (WireGuard replaces udp_relay_*)
 
 The old Bedrock path wrapped UDP inside frp's TCP tunnel (`catcher/udp_relay_catcher.ts`
@@ -18,9 +45,12 @@ real RakNet unconnected-ping/pong before AND after removing the old services (on
 cut over once the new path proved MOTD came back through DNAT correctly), then
 re-verified Java + Bedrock end to end through `mc.mliem.com` after cutover.
 
-Setup was manual (two boxes, one tunnel, not worth a script): `wg genkey`/`wg pubkey`
-on each side, `/etc/wireguard/wg0.conf` on each with the peer's public key and
-`AllowedIPs`, `wg-quick@wg0` enabled via systemd for boot persistence. Three gotchas:
+Setup was manual the first time: `wg genkey`/`wg pubkey` on each side,
+`/etc/wireguard/wg0.conf` on each with the peer's public key and `AllowedIPs`,
+`wg-quick@wg0` enabled via systemd for boot persistence. Now codified in
+`scripts/provision_wireguard.sh` (2026-08-21, see the entry below), idempotent and
+safe to re-run against a box already in this state. Three gotchas from the manual
+setup, still relevant since the script encodes the same fixes:
 
 1. **MTU**: catcher's `wg0` came up at MTU 8920, inherited from Oracle's internal
    jumbo-frame VCN interface (`ens3` at MTU 9000). Fine on Oracle's own internal
