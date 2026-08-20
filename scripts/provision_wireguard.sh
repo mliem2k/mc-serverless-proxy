@@ -95,8 +95,13 @@ else
 fi
 PUBLIC_KEY="$(echo "$PRIVATE_KEY" | wg pubkey)"
 
+OLD_CONF_CONTENT=""
+if [ -f "$WG_CONF" ]; then
+  OLD_CONF_CONTENT="$(cat "$WG_CONF")"
+fi
+
 if [ "$ROLE" = "catcher" ]; then
-  cat > "$WG_CONF" <<EOF
+  NEW_CONF_CONTENT="$(cat <<EOF
 [Interface]
 MTU = ${WG_MTU}
 PrivateKey = ${PRIVATE_KEY}
@@ -107,8 +112,9 @@ ListenPort = ${WG_LISTEN_PORT}
 PublicKey = ${WG_PEER_PUBLIC_KEY}
 AllowedIPs = ${WG_PEER_ADDRESS}/32
 EOF
+)"
 else
-  cat > "$WG_CONF" <<EOF
+  NEW_CONF_CONTENT="$(cat <<EOF
 [Interface]
 PrivateKey = ${PRIVATE_KEY}
 Address = ${WG_OWN_ADDRESS}
@@ -119,8 +125,36 @@ Endpoint = ${WG_PEER_ENDPOINT}
 AllowedIPs = ${WG_PEER_ADDRESS}/32
 PersistentKeepalive = 25
 EOF
+)"
 fi
+
+CONFIG_CHANGED=1
+if [ "$NEW_CONF_CONTENT" = "$OLD_CONF_CONTENT" ]; then
+  CONFIG_CHANGED=0
+  echo "config content unchanged"
+fi
+
+printf '%s\n' "$NEW_CONF_CONTENT" > "$WG_CONF"
 chmod 600 "$WG_CONF"
+
+# systemd's own "is this unit active" bookkeeping can desync from the real
+# kernel interface state (observed live: a prior successful `wg-quick up`
+# left the interface healthy but systemctl later reported it inactive), so
+# "restart" is unsafe to call blindly, it can hit wg-quick's own
+# "wg0 already exists" failure against an interface systemd thinks is down.
+# Base the decision on the kernel's own view (ip link) instead, and when a
+# reload is genuinely needed, tear the interface down by force before
+# bringing it back up rather than trusting a plain restart to sequence that
+# correctly.
+bring_up_wg0() {
+  if [ "$CONFIG_CHANGED" = "0" ] && ip link show wg0 >/dev/null 2>&1; then
+    echo "wg0 interface already up with matching config, leaving it running"
+    return 0
+  fi
+  wg-quick down wg0 >/dev/null 2>&1 || true
+  ip link delete wg0 >/dev/null 2>&1 || true
+  systemctl start wg-quick@wg0
+}
 
 if [ "$ROLE" = "catcher" ]; then
   # ensure_iptables_rule <chain> <rule args...>
@@ -182,7 +216,7 @@ if [ "$ROLE" = "catcher" ]; then
   echo "==> [8/$TOTAL_STEPS] enabling + starting wg-quick@wg0"
   systemctl daemon-reload
   systemctl enable wg-quick@wg0
-  systemctl restart wg-quick@wg0
+  bring_up_wg0
 
   echo "==> [9/$TOTAL_STEPS] status check"
   systemctl is-active wg-quick@wg0 || true
@@ -193,7 +227,7 @@ else
   echo "==> [4/$TOTAL_STEPS] enabling + starting wg-quick@wg0"
   systemctl daemon-reload
   systemctl enable wg-quick@wg0
-  systemctl restart wg-quick@wg0
+  bring_up_wg0
 
   echo "==> [5/$TOTAL_STEPS] status check"
   systemctl is-active wg-quick@wg0 || true
